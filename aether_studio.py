@@ -1,2123 +1,2795 @@
 
-# -*- coding: utf-8 -*-
-"""
-AETHER AI ULTIMATE STUDIO
-Unified PySide6 interface for the existing AIExoticLocal engine.
-
-Existing app.py is preserved and imported as the backend.
-"""
-
 from __future__ import annotations
 
 import os
 import sys
+import re
+import json
 import traceback
 import subprocess
+import urllib.request
+import urllib.parse
 from pathlib import Path
+from datetime import datetime
 
-ROOT = Path(__file__).resolve().parent
-MODELS_DIR = ROOT / "models"
-OUTPUT_DIR = ROOT / "output_media"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+from PySide6.QtCore import Qt, QObject, QThread, Signal, QPointF
+from PySide6.QtGui import (
+    QPixmap, QImage, QPainter, QPen, QColor, QIcon, QFont
+)
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QFormLayout, QGridLayout, QStackedWidget, QListWidget,
+    QListWidgetItem, QLabel, QPushButton, QLineEdit, QTextEdit,
+    QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QFileDialog,
+    QMessageBox, QGroupBox, QScrollArea, QProgressBar, QSplitter,
+    QFrame, QSlider
+)
 
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-
-# ------------------------------------------------------------
-# BACKEND
-# ------------------------------------------------------------
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "max_split_size_mb:64,expandable_segments:True"
+)
 
 try:
     import app as engine
-    ENGINE_ERROR = None
 except Exception as exc:
     engine = None
-    ENGINE_ERROR = f"{type(exc).__name__}: {exc}"
+    ENGINE_ERROR = exc
+else:
+    ENGINE_ERROR = None
 
-# ------------------------------------------------------------
-# QT
-# ------------------------------------------------------------
 
-from PySide6.QtCore import (
-    Qt, QObject, QThread, Signal, QSize
-)
+APP_NAME = "AETHER AI ULTIMATE STUDIO"
+VERSION = "ULTIMATE 2026"
 
-from PySide6.QtGui import (
-    QPixmap, QAction, QFont
-)
 
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QFrame,
-    QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QStackedWidget, QFileDialog,
-    QLineEdit, QTextEdit, QComboBox,
-    QSpinBox, QDoubleSpinBox, QProgressBar,
-    QMessageBox, QGroupBox, QFormLayout,
-    QCheckBox
-)
+def smooth_video_to_60fps(video_path, callback):
+    """Create a motion-interpolated 60 FPS copy using FFmpeg minterpolate."""
+    video_path = Path(video_path)
+    if not video_path.is_file():
+        raise FileNotFoundError(f"Видео для интерполяции не найдено: {video_path}")
+    ffmpeg = engine.get_ffmpeg()
+    output_path = video_path.with_name(video_path.stem + "_60fps.mp4")
+    if output_path.exists():
+        output_path = video_path.with_name(
+            f"{video_path.stem}_60fps_{datetime.now():%H%M%S}.mp4"
+        )
+    command = [
+        ffmpeg, "-y", "-i", str(video_path),
+        "-map", "0:v:0", "-map", "0:a?",
+        "-vf",
+        "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", str(output_path)
+    ]
+    callback(None, "Интерполяция движения до 60 FPS: FFmpeg minterpolate. Это может занять время.")
+    process = subprocess.run(
+        command, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=7200
+    )
+    if process.returncode != 0 or not output_path.is_file():
+        raise RuntimeError(
+            "Не удалось создать 60 FPS версию.\n"
+            + (process.stderr or process.stdout or "FFmpeg error")[-3500:]
+        )
+    callback(None, f"Плавная версия 60 FPS сохранена: {output_path}")
 
-# ------------------------------------------------------------
-# WORKER
-# ------------------------------------------------------------
+
+def _video_path_from_message(message):
+    if not message:
+        return None
+    match = re.search(r'([A-Za-z]:[\\/][^\r\n]*?\.mp4|/[^\r\n]*?\.mp4)', str(message), re.I)
+    if not match:
+        return None
+    candidate = Path(match.group(1).strip().strip('"'))
+    return candidate if candidate.is_file() else None
+
 
 class Worker(QObject):
-
-    finished = Signal(object)
+    message = Signal(object, str)
+    finished = Signal()
     failed = Signal(str)
-    message = Signal(str)
 
-    def __init__(self, function, *args, **kwargs):
+    def __init__(self, function):
         super().__init__()
-
         self.function = function
-        self.args = args
-        self.kwargs = kwargs
-
-    def callback(self, *args):
-
-        message = " ".join(
-            str(x) for x in args
-            if x is not None
-        )
-
-        if message:
-            self.message.emit(message)
 
     def run(self):
-
         try:
-            result = self.function(
-                *self.args,
-                **self.kwargs
-            )
-
-            self.finished.emit(result)
-
+            self.function(self.message.emit)
+            self.finished.emit()
         except Exception:
             self.failed.emit(traceback.format_exc())
 
 
-# ------------------------------------------------------------
-# FILE PICKER
-# ------------------------------------------------------------
+class MaskCanvas(QWidget):
+    """Image preview with a paintable inpainting mask."""
 
-class FilePicker(QWidget):
-
-    def __init__(
-        self,
-        file_filter="All files (*.*)",
-        save=False
-    ):
-
+    def __init__(self):
         super().__init__()
+        self.setMinimumSize(420, 360)
+        self.setMouseTracking(True)
+        self.image = None
+        self.image_path = None
+        self.strokes = []
+        self.current_stroke = None
+        self.brush_size = 35
 
-        self.save_mode = save
-        self.file_filter = file_filter
+    def load_image(self, path):
+        from PIL import Image
+        self.image_path = str(path)
+        self.image = Image.open(path).convert("RGB")
+        self.strokes.clear()
+        self.current_stroke = None
+        self.update()
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+    def clear_mask(self):
+        self.strokes.clear()
+        self.current_stroke = None
+        self.update()
 
-        self.edit = QLineEdit()
-        self.edit.setPlaceholderText("Select file...")
+    def _display_rect(self):
+        if self.image is None:
+            return None
 
-        self.button = QPushButton("Browse")
-        self.button.setObjectName("secondary")
+        iw, ih = self.image.size
+        scale = min(
+            self.width() / iw,
+            self.height() / ih
+        )
+        w = iw * scale
+        h = ih * scale
 
-        layout.addWidget(self.edit, 1)
-        layout.addWidget(self.button)
+        x = (self.width() - w) / 2
+        y = (self.height() - h) / 2
 
-        self.button.clicked.connect(self.browse)
+        return x, y, w, h
 
-    def browse(self):
+    def _map_position(self, pos):
+        rect = self._display_rect()
+        if rect is None:
+            return None
 
-        if self.save_mode:
+        x, y, w, h = rect
 
-            path, _ = QFileDialog.getSaveFileName(
-                self,
-                "Save file",
-                str(OUTPUT_DIR),
-                self.file_filter
+        px = (pos.x() - x) / w
+        py = (pos.y() - y) / h
+
+        if not (0 <= px <= 1 and 0 <= py <= 1):
+            return None
+
+        iw, ih = self.image.size
+
+        return (
+            int(px * iw),
+            int(py * ih)
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton or self.image is None:
+            return
+
+        point = self._map_position(event.position())
+
+        if point:
+            self.current_stroke = [point]
+            self.strokes.append(self.current_stroke)
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.current_stroke is None:
+            return
+
+        point = self._map_position(event.position())
+
+        if point:
+            self.current_stroke.append(point)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        self.current_stroke = None
+
+    def get_mask(self):
+        from PIL import Image, ImageDraw
+
+        if self.image is None:
+            raise RuntimeError("Сначала загрузи исходное изображение.")
+
+        mask = Image.new("L", self.image.size, 0)
+        draw = ImageDraw.Draw(mask)
+
+        radius = max(1, int(self.brush_size / 2))
+
+        for stroke in self.strokes:
+            if not stroke:
+                continue
+
+            if len(stroke) == 1:
+                x, y = stroke[0]
+                draw.ellipse(
+                    (x-radius, y-radius, x+radius, y+radius),
+                    fill=255
+                )
+            else:
+                draw.line(
+                    stroke,
+                    fill=255,
+                    width=radius * 2
+                )
+
+                for x, y in stroke:
+                    draw.ellipse(
+                        (x-radius, y-radius, x+radius, y+radius),
+                        fill=255
+                    )
+
+        return mask
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#101522"))
+
+        if self.image is None:
+            painter.setPen(QColor("#8995ad"))
+            painter.drawText(
+                self.rect(),
+                Qt.AlignCenter,
+                "Открой изображение для редактирования"
             )
+            return
 
-        else:
+        data = self.image.tobytes("raw", "RGB")
+        iw, ih = self.image.size
 
-            path, _ = QFileDialog.getOpenFileName(
-                self,
-                "Select file",
-                str(ROOT),
-                self.file_filter
-            )
+        qimage = QImage(
+            data,
+            iw,
+            ih,
+            iw * 3,
+            QImage.Format_RGB888
+        ).copy()
 
-        if path:
-            self.edit.setText(path)
+        pixmap = QPixmap.fromImage(qimage)
+        x, y, w, h = self._display_rect()
 
-    def text(self):
-        return self.edit.text().strip()
+        target = self.rect()
+        painter.drawPixmap(
+            int(x), int(y),
+            int(w), int(h),
+            pixmap
+        )
 
+        painter.setPen(
+            QPen(QColor(255, 40, 100, 150),
+                 max(1, int(self.brush_size * w / iw)),
+                 Qt.SolidLine,
+                 Qt.RoundCap,
+                 Qt.RoundJoin)
+        )
 
-# ------------------------------------------------------------
-# PAGE
-# ------------------------------------------------------------
+        for stroke in self.strokes:
+            if not stroke:
+                continue
 
-class StudioPage(QWidget):
+            points = [
+                QPointF(
+                    x + px * w / iw,
+                    y + py * h / ih
+                )
+                for px, py in stroke
+            ]
 
-    def __init__(self, title, description=""):
+            if len(points) == 1:
+                painter.drawPoint(points[0])
+            else:
+                for index in range(len(points)-1):
+                    painter.drawLine(
+                        points[index],
+                        points[index+1]
+                    )
 
-        super().__init__()
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 22)
-        layout.setSpacing(15)
-
-        heading = QLabel(title)
-        heading.setObjectName("pageTitle")
-
-        layout.addWidget(heading)
-
-        if description:
-
-            subtitle = QLabel(description)
-            subtitle.setObjectName("subtitle")
-            subtitle.setWordWrap(True)
-
-            layout.addWidget(subtitle)
-
-        self.body = QVBoxLayout()
-        self.body.setSpacing(14)
-
-        layout.addLayout(self.body)
-        layout.addStretch(1)
-
-
-# ------------------------------------------------------------
-# MAIN WINDOW
-# ------------------------------------------------------------
 
 class AetherStudio(QMainWindow):
 
-    worker_log = Signal(str)
-
     def __init__(self):
-
         super().__init__()
 
+        if engine is None:
+            raise RuntimeError(
+                "Не удалось импортировать app.py:\n"
+                + str(ENGINE_ERROR)
+            )
+
         self.setWindowTitle(
-            "AETHER AI ULTIMATE STUDIO"
+            f"{APP_NAME} — {VERSION}"
         )
+        self.resize(1540, 960)
+        self.setMinimumSize(1120, 740)
 
-        self.resize(1500, 950)
-        self.setMinimumSize(1100, 700)
-
-        self.thread = None
-        self.worker = None
-
+        self.fields = {}
         self.pages = {}
-        self.navigation = []
+        self.timeline_items = []
+        self.scene_data = []
+
+        self.worker = None
+        self.thread = None
+        self.last_image = None
+        self._close_when_done = False
 
         self._build_interface()
-        self.worker_log.connect(self.log)
-        self.refresh_status()
+        self.refresh_models()
+        self.refresh_system()
 
-    # --------------------------------------------------------
-    # UI BUILD
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
+    # GENERAL UI
+    # ---------------------------------------------------------
 
     def _build_interface(self):
+        root = QWidget()
+        self.setCentralWidget(root)
 
-        central = QWidget()
-        self.setCentralWidget(central)
+        main = QVBoxLayout(root)
+        main.setContentsMargins(12, 12, 12, 8)
+        main.setSpacing(8)
 
-        main = QHBoxLayout(central)
-        main.setContentsMargins(0, 0, 0, 0)
-        main.setSpacing(0)
+        header = QHBoxLayout()
 
-        sidebar = QFrame()
-        sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(235)
+        title = QLabel("AETHER")
+        title.setObjectName("MainTitle")
 
-        side = QVBoxLayout(sidebar)
-        side.setContentsMargins(18, 22, 18, 18)
-        side.setSpacing(8)
+        subtitle = QLabel(
+            "AI ULTIMATE STUDIO  /  LOCAL GENERATION ENVIRONMENT"
+        )
+        subtitle.setObjectName("Subtitle")
 
-        brand = QLabel("AETHER")
-        brand.setObjectName("brand")
+        header.addWidget(title)
+        header.addWidget(subtitle)
+        header.addStretch()
 
-        side.addWidget(brand)
+        self.gpu_label = QLabel("ENGINE: INITIALIZING")
+        self.gpu_label.setObjectName("StatusLabel")
+        header.addWidget(self.gpu_label)
 
-        subtitle = QLabel("AI ULTIMATE STUDIO")
-        subtitle.setObjectName("brandSub")
+        main.addLayout(header)
 
-        side.addWidget(subtitle)
-        side.addSpacing(22)
+        splitter = QSplitter(Qt.Horizontal)
+
+        self.navigation = QListWidget()
+        self.navigation.setObjectName("Navigation")
+        self.navigation.setFixedWidth(230)
 
         self.stack = QStackedWidget()
 
-        items = [
-            ("⌂", "Overview", self.page_overview),
-            ("✦", "Image Studio", self.page_image),
-            ("◉", "Portrait / Upscale", self.page_restore),
-            ("◎", "Face Studio", self.page_face),
-            ("▶", "Video Studio", self.page_video),
-            ("⌁", "ControlNet", self.page_controlnet),
-            ("♫", "Voice Studio", self.page_voice),
-            ("◌", "Lip Sync", self.page_lipsync),
-            ("▤", "Timeline", self.page_timeline),
-        ]
+        splitter.addWidget(self.navigation)
+        splitter.addWidget(self.stack)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
 
-        for icon, title, builder in items:
-
-            button = QPushButton(
-                f"{icon}    {title}"
-            )
-
-            button.setObjectName("navButton")
-            button.setCursor(Qt.PointingHandCursor)
-
-            button.clicked.connect(
-                lambda checked=False, b=builder, btn=button:
-                self.navigate(b, btn)
-            )
-
-            side.addWidget(button)
-            self.navigation.append(button)
-
-        side.addStretch(1)
-
-        self.gpu_status = QLabel("GPU: checking")
-        self.engine_status = QLabel("ENGINE: checking")
-
-        self.gpu_status.setObjectName("sideStatus")
-        self.engine_status.setObjectName("sideStatus")
-
-        side.addWidget(self.gpu_status)
-        side.addWidget(self.engine_status)
-
-        main.addWidget(sidebar)
-
-        right = QVBoxLayout()
-        right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(0)
-
-        main.addLayout(right, 1)
-
-        topbar = QFrame()
-        topbar.setObjectName("topbar")
-
-        top_layout = QHBoxLayout(topbar)
-        top_layout.setContentsMargins(24, 12, 24, 12)
-
-        self.section_title = QLabel("Overview")
-        self.section_title.setObjectName("topTitle")
-
-        top_layout.addWidget(self.section_title)
-        top_layout.addStretch(1)
-
-        self.status_badge = QLabel("READY")
-        self.status_badge.setObjectName("readyPill")
-
-        top_layout.addWidget(self.status_badge)
-
-        right.addWidget(topbar)
-
-        right.addWidget(self.stack, 1)
-
-        # ACTIVITY PANEL
-
-        activity = QFrame()
-        activity.setObjectName("bottomPanel")
-
-        activity_layout = QVBoxLayout(activity)
-        activity_layout.setContentsMargins(20, 10, 20, 12)
-
-        row = QHBoxLayout()
-
-        title = QLabel("ACTIVITY LOG")
-        title.setObjectName("smallHeading")
-
-        row.addWidget(title)
-        row.addStretch(1)
-
-        self.progress_label = QLabel("Idle")
-        self.progress_label.setObjectName("muted")
-
-        row.addWidget(self.progress_label)
-
-        activity_layout.addLayout(row)
+        main.addWidget(splitter, 1)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.progress.setTextVisible(False)
-        self.progress.setFixedHeight(5)
+        self.progress.setTextVisible(True)
 
-        activity_layout.addWidget(self.progress)
+        main.addWidget(self.progress)
+
+        bottom = QHBoxLayout()
+
+        self.status = QLabel("Ready")
+        self.status.setObjectName("StatusLabel")
+
+        self.busy_label = QLabel("IDLE")
+        self.busy_label.setObjectName("StatusLabel")
+
+        bottom.addWidget(self.status, 1)
+        bottom.addWidget(self.busy_label)
+
+        main.addLayout(bottom)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMaximumHeight(100)
+        self.log_box.setMaximumHeight(105)
+        self.log_box.setPlaceholderText("Activity log")
 
-        activity_layout.addWidget(self.log_box)
+        main.addWidget(self.log_box)
 
-        right.addWidget(activity)
+        self._create_pages()
 
-        # CREATE PAGES
-
-        builders = [
-            self.page_overview,
-            self.page_image,
-            self.page_restore,
-            self.page_face,
-            self.page_video,
-            self.page_controlnet,
-            self.page_voice,
-            self.page_lipsync,
-            self.page_timeline,
-        ]
-
-        for builder in builders:
-
-            page = builder()
-
-            self.pages[builder.__name__] = page
-            self.stack.addWidget(page)
-
-        self.navigate(
-            self.page_overview,
-            self.navigation[0]
-        )
-
-        # MENU
-
-        file_menu = self.menuBar().addMenu("File")
-
-        open_output = QAction(
-            "Open output folder", self
-        )
-
-        open_output.triggered.connect(
-            self.open_output
-        )
-
-        file_menu.addAction(open_output)
-
-        refresh = QAction(
-            "Refresh system status", self
-        )
-
-        refresh.triggered.connect(
-            self.refresh_status
-        )
-
-        file_menu.addAction(refresh)
-
-    # --------------------------------------------------------
-    # COMMON COMPONENTS
-    # --------------------------------------------------------
-
-    def card(self, title, description=""):
-
-        box = QGroupBox(title)
-        box.setObjectName("moduleCard")
-
-        layout = QVBoxLayout(box)
-        layout.setSpacing(10)
-
-        if description:
-
-            label = QLabel(description)
-            label.setObjectName("muted")
-            label.setWordWrap(True)
-
-            layout.addWidget(label)
-
-        form = QFormLayout()
-        form.setSpacing(10)
-
-        layout.addLayout(form)
-
-        return box, form
-
-    def navigate(self, builder, button=None):
-
-        page = self.pages.get(builder.__name__)
-
-        if page is None:
-            return
-
-        self.stack.setCurrentWidget(page)
-
-        names = {
-            "page_overview": "Overview",
-            "page_image": "Image Studio",
-            "page_restore": "Portrait / Upscale",
-            "page_face": "Face Studio",
-            "page_video": "Video Studio",
-            "page_controlnet": "ControlNet",
-            "page_voice": "Voice Studio",
-            "page_lipsync": "Lip Sync",
-            "page_timeline": "Timeline",
-        }
-
-        self.section_title.setText(
-            names.get(builder.__name__, "AETHER")
-        )
-
-        for item in self.navigation:
-
-            item.setProperty(
-                "active",
-                item is button
-            )
-
-            item.style().unpolish(item)
-            item.style().polish(item)
-
-    def required(self, *values):
-
-        if any(
-            not str(value).strip()
-            for value in values
-        ):
-
-            raise ValueError(
-                "Please complete all required fields."
-            )
-
-    def backend(self):
-
-        if engine is None:
-
-            raise RuntimeError(
-                "Could not import app.py:\n"
-                + str(ENGINE_ERROR)
-            )
-
-        return engine
-
-    def model_relative(self, value):
-
-        value = str(value).strip()
-
-        self.required(value)
-
-        path = Path(value)
-
-        if path.is_absolute():
-
-            try:
-
-                return str(
-                    path.relative_to(MODELS_DIR)
-                )
-
-            except ValueError:
-
-                return value
-
-        return value
-
-    # --------------------------------------------------------
-    # MODEL DISCOVERY
-    # --------------------------------------------------------
-
-    def populate_models(self, combo):
-
-        combo.clear()
-
-        if engine is None:
-
-            combo.addItem("Engine unavailable")
-            return
-
-        found = []
-
-        try:
-
-            result = engine.list_checkpoints()
-
-            if isinstance(result, (list, tuple)):
-
-                for item in result:
-
-                    if isinstance(item, (str, Path)):
-                        found.append(str(item))
-
-                    elif isinstance(item, dict):
-
-                        found.append(
-                            str(
-                                item.get("path")
-                                or item.get("name")
-                            )
-                        )
-
-        except Exception:
-            pass
-
-        if not found and MODELS_DIR.exists():
-
-            for path in MODELS_DIR.rglob("*"):
-
-                if path.is_file() and path.suffix.lower() in {
-                    ".safetensors",
-                    ".ckpt",
-                    ".gguf"
-                }:
-
-                    try:
-
-                        found.append(
-                            str(path.relative_to(MODELS_DIR))
-                        )
-
-                    except ValueError:
-                        pass
-
-                elif path.is_dir() and (
-                    path / "model_index.json"
-                ).exists():
-
-                    found.append(
-                        str(path.relative_to(MODELS_DIR))
-                    )
-
-        for item in sorted(set(found), key=str.lower):
-            combo.addItem(item)
-
-        if not found:
-            combo.addItem("No models discovered")
-
-    # --------------------------------------------------------
-    # OVERVIEW
-    # --------------------------------------------------------
-
-    def page_overview(self):
-
-        page = StudioPage(
-            "Welcome to AETHER",
-            "Your local AI creative workstation."
-        )
-
-        grid = QGridLayout()
-        grid.setSpacing(12)
-
-        modules = [
-            (
-                "IMAGE STUDIO",
-                "Text-to-image, image-to-image and inpainting."
-            ),
-            (
-                "PORTRAIT STUDIO",
-                "GFPGAN restoration and Real-ESRGAN upscaling."
-            ),
-            (
-                "FACE STUDIO",
-                "InsightFace image and video face swap."
-            ),
-            (
-                "VIDEO STUDIO",
-                "AnimateDiff and Stable Video Diffusion."
-            ),
-            (
-                "CONTROLNET",
-                "Canny, Depth, OpenPose and Tile."
-            ),
-            (
-                "VOICE STUDIO",
-                "Piper, RVC and audio-driven lip sync."
-            ),
-        ]
-
-        for i, (title, description) in enumerate(modules):
-
-            box, _ = self.card(title, description)
-
-            grid.addWidget(
-                box,
-                i // 3,
-                i % 3
-            )
-
-        page.body.addLayout(grid)
-
-        system, form = self.card(
-            "SYSTEM INFORMATION",
-            "Local engine connection."
-        )
-
-        self.overview_info = QLabel()
-        self.overview_info.setWordWrap(True)
-
-        form.addRow(self.overview_info)
-
-        page.body.addWidget(system)
-
-        button = QPushButton("Open output folder")
-        button.clicked.connect(self.open_output)
-
-        page.body.addWidget(button)
-
-        return page
-
-    # --------------------------------------------------------
-    # IMAGE STUDIO
-    # --------------------------------------------------------
-
-    def page_image(self):
-
-        page = StudioPage(
-            "Image Studio",
-            "Generate images using the local Diffusers engine."
-        )
-
-        box, form = self.card(
-            "IMAGE GENERATION",
-            "Uses run_generation() from the existing app.py."
-        )
-
-        self.gen_model = QComboBox()
-        self.populate_models(self.gen_model)
-
-        self.gen_task = QComboBox()
-        self.gen_task.addItems([
-            "txt2img",
-            "img2img",
-            "inpaint",
-            "outpaint"
-        ])
-
-        self.gen_prompt = QTextEdit()
-        self.gen_prompt.setFixedHeight(90)
-        self.gen_prompt.setPlaceholderText(
-            "Describe your image..."
-        )
-
-        self.gen_negative = QLineEdit()
-        self.gen_negative.setPlaceholderText(
-            "Negative prompt"
-        )
-
-        self.gen_source = FilePicker(
-            "Images (*.png *.jpg *.jpeg *.webp)"
-        )
-
-        self.gen_mask = FilePicker(
-            "Images (*.png *.jpg *.jpeg *.webp)"
-        )
-
-        self.gen_steps = QSpinBox()
-        self.gen_steps.setRange(1, 100)
-        self.gen_steps.setValue(25)
-
-        self.gen_cfg = QDoubleSpinBox()
-        self.gen_cfg.setRange(0.1, 30)
-        self.gen_cfg.setValue(7)
-
-        self.gen_strength = QDoubleSpinBox()
-        self.gen_strength.setRange(0.01, 1)
-        self.gen_strength.setValue(0.65)
-
-        self.gen_width = QSpinBox()
-        self.gen_width.setRange(256, 1536)
-        self.gen_width.setSingleStep(64)
-        self.gen_width.setValue(768)
-
-        self.gen_height = QSpinBox()
-        self.gen_height.setRange(256, 1536)
-        self.gen_height.setSingleStep(64)
-        self.gen_height.setValue(768)
-
-        self.gen_seed = QSpinBox()
-        self.gen_seed.setRange(-1, 2147483647)
-        self.gen_seed.setValue(-1)
-
-        self.gen_lora = QLineEdit()
-        self.gen_lora.setPlaceholderText(
-            "Optional LoRA path relative to models"
-        )
-
-        self.gen_lora_scale = QDoubleSpinBox()
-        self.gen_lora_scale.setRange(-2, 2)
-        self.gen_lora_scale.setValue(1)
-
-        self.gen_vae = QLineEdit()
-        self.gen_vae.setPlaceholderText(
-            "Optional VAE path relative to models"
-        )
-
-        form.addRow("Model", self.gen_model)
-        form.addRow("Task", self.gen_task)
-        form.addRow("Prompt", self.gen_prompt)
-        form.addRow("Negative prompt", self.gen_negative)
-        form.addRow("Source image", self.gen_source)
-        form.addRow("Mask image", self.gen_mask)
-        form.addRow("Steps", self.gen_steps)
-        form.addRow("CFG", self.gen_cfg)
-        form.addRow("Strength", self.gen_strength)
-        form.addRow("Width", self.gen_width)
-        form.addRow("Height", self.gen_height)
-        form.addRow("Seed (-1 = random)", self.gen_seed)
-        form.addRow("LoRA path", self.gen_lora)
-        form.addRow("LoRA scale", self.gen_lora_scale)
-        form.addRow("VAE path", self.gen_vae)
-
-        run = QPushButton("Generate image")
-        run.clicked.connect(self.run_generation)
-
-        form.addRow(run)
-
-        page.body.addWidget(box)
-
-        self.image_preview = QLabel(
-            "Generated image preview"
-        )
-
-        self.image_preview.setObjectName("preview")
-        self.image_preview.setAlignment(Qt.AlignCenter)
-        self.image_preview.setMinimumHeight(230)
-
-        page.body.addWidget(self.image_preview)
-
-        refresh = QPushButton("Refresh preview")
-        refresh.setObjectName("secondary")
-        refresh.clicked.connect(self.refresh_preview)
-
-        page.body.addWidget(refresh)
-
-        return page
-
-    def run_generation(self):
-
-        try:
-
-            e = self.backend()
-
-            prompt = self.gen_prompt.toPlainText().strip()
-            self.required(prompt)
-
-            task = self.gen_task.currentText()
-
-            source = self.gen_source.text() or None
-            mask = self.gen_mask.text() or None
-
-            if task != "txt2img" and not source:
-
-                raise ValueError(
-                    "This task requires a source image."
-                )
-
-            if task == "inpaint" and not mask:
-
-                raise ValueError(
-                    "Inpainting requires a mask image."
-                )
-
-            self.start_task(
-                e.run_generation,
-                task,
-                self.model_relative(
-                    self.gen_model.currentText()
-                ),
-                prompt,
-                self.gen_negative.text(),
-                source,
-                mask,
-                self.gen_steps.value(),
-                self.gen_cfg.value(),
-                self.gen_strength.value(),
-                self.gen_width.value(),
-                self.gen_height.value(),
-                self.gen_seed.value(),
-                self.task_callback,
-                lora_rel=self.gen_lora.text().strip() or None,
-                lora_scale=self.gen_lora_scale.value(),
-                vae_rel=self.gen_vae.text().strip() or None,
-                embedding_rel=None,
-                ip_adapter_rel=None,
-                ip_image_path=None
-            )
-
-        except Exception as exc:
-
-            self.warning("Image generation", exc)
-
-    # --------------------------------------------------------
-    # PORTRAIT / UPSCALE
-    # --------------------------------------------------------
-
-    def page_restore(self):
-
-        page = StudioPage(
-            "Portrait & Upscale",
-            "Connects to the tested GFPGAN and Real-ESRGAN functions."
-        )
-
-        box, form = self.card(
-            "GFPGAN RESTORATION",
-            "Restore portrait details with GFPGANv1.4."
-        )
-
-        self.restore_file = FilePicker(
-            "Images (*.png *.jpg *.jpeg *.webp)"
-        )
-
-        form.addRow("Input image", self.restore_file)
-
-        button = QPushButton("Restore portrait")
-        button.clicked.connect(self.run_restore)
-
-        form.addRow(button)
-
-        page.body.addWidget(box)
-
-        up, uf = self.card(
-            "REAL-ESRGAN UPSCALER",
-            "Uses the portable Real-ESRGAN executable."
-        )
-
-        self.upscale_file = FilePicker(
-            "Images (*.png *.jpg *.jpeg *.webp)"
-        )
-
-        self.upscale_scale = QComboBox()
-        self.upscale_scale.addItems(["2", "3", "4"])
-
-        self.upscale_model = QComboBox()
-        self.upscale_model.addItems([
-            "realesrgan-x4plus",
-            "realesrgan-x4plus-anime",
-            "realesr-animevideov3-x2",
-            "realesr-animevideov3-x3",
-            "realesr-animevideov3-x4"
-        ])
-
-        uf.addRow("Input image", self.upscale_file)
-        uf.addRow("Scale", self.upscale_scale)
-        uf.addRow("Model", self.upscale_model)
-
-        run = QPushButton("Upscale image")
-        run.clicked.connect(self.run_upscale)
-
-        uf.addRow(run)
-
-        page.body.addWidget(up)
-
-        self.restore_preview = QLabel("Output preview")
-        self.restore_preview.setObjectName("preview")
-        self.restore_preview.setAlignment(Qt.AlignCenter)
-        self.restore_preview.setMinimumHeight(220)
-
-        page.body.addWidget(self.restore_preview)
-
-        return page
-
-    def run_restore(self):
-
-        try:
-
-            e = self.backend()
-            self.required(self.restore_file.text())
-
-            self.start_task(
-                e.restore_portrait,
-                self.restore_file.text(),
-                self.task_callback
-            )
-
-        except Exception as exc:
-
-            self.warning("GFPGAN", exc)
-
-    def run_upscale(self):
-
-        try:
-
-            e = self.backend()
-            self.required(self.upscale_file.text())
-
-            from PIL import Image
-
-            image = Image.open(
-                self.upscale_file.text()
-            ).convert("RGB")
-
-            scale = int(
-                self.upscale_scale.currentText()
-            )
-
-            model = self.upscale_model.currentText()
-
-            self.start_task(
-                e.upscale_image,
-                image,
-                self.task_callback,
-                scale,
-                model
-            )
-
-        except Exception as exc:
-
-            self.warning("Real-ESRGAN", exc)
-
-    # --------------------------------------------------------
-    # FACE STUDIO
-    # --------------------------------------------------------
-
-    def page_face(self):
-
-        page = StudioPage(
-            "Face Studio",
-            "Use only your own face or identities you have permission to use."
-        )
-
-        box, form = self.card(
-            "IMAGE FACE SWAP",
-            "InsightFace image processing."
-        )
-
-        self.face_source = FilePicker(
-            "Images (*.png *.jpg *.jpeg *.webp)"
-        )
-
-        self.face_target = FilePicker(
-            "Images (*.png *.jpg *.jpeg *.webp)"
-        )
-
-        self.face_consent = QCheckBox(
-            "I have the necessary rights and consent."
-        )
-
-        form.addRow("Source face", self.face_source)
-        form.addRow("Target image", self.face_target)
-        form.addRow(self.face_consent)
-
-        button = QPushButton("Run image face swap")
-        button.clicked.connect(self.run_face_swap)
-
-        form.addRow(button)
-
-        page.body.addWidget(box)
-
-        video, vf = self.card(
-            "VIDEO FACE SWAP",
-            "InsightFace video processing."
-        )
-
-        self.video_source = FilePicker(
-            "Images (*.png *.jpg *.jpeg)"
-        )
-
-        self.video_target = FilePicker(
-            "Videos (*.mp4 *.mov *.mkv *.avi)"
-        )
-
-        self.video_consent = QCheckBox(
-            "I have the necessary rights and consent."
-        )
-
-        vf.addRow("Source face", self.video_source)
-        vf.addRow("Target video", self.video_target)
-        vf.addRow(self.video_consent)
-
-        run = QPushButton("Run video face swap")
-        run.clicked.connect(self.run_video_face_swap)
-
-        vf.addRow(run)
-
-        page.body.addWidget(video)
-
-        unavailable, uf = self.card(
-            "FACEFUSION",
-            "FaceFusion runtime is not currently connected."
-        )
-
-        label = QLabel(
-            "NOT INSTALLED / NOT CONNECTED"
-        )
-
-        label.setObjectName("warningText")
-        uf.addRow(label)
-
-        page.body.addWidget(unavailable)
-
-        return page
-
-    def run_face_swap(self):
-
-        try:
-
-            e = self.backend()
-
-            self.required(
-                self.face_source.text(),
-                self.face_target.text()
-            )
-
-            if not self.face_consent.isChecked():
-
-                raise ValueError(
-                    "Confirm that you have the necessary rights and consent."
-                )
-
-            self.start_task(
-                e.run_face_swap,
-                self.face_source.text(),
-                self.face_target.text(),
-                self.task_callback
-            )
-
-        except Exception as exc:
-
-            self.warning("Face swap", exc)
-
-    def run_video_face_swap(self):
-
-        try:
-
-            e = self.backend()
-
-            self.required(
-                self.video_source.text(),
-                self.video_target.text()
-            )
-
-            if not self.video_consent.isChecked():
-
-                raise ValueError(
-                    "Confirm that you have the necessary rights and consent."
-                )
-
-            self.start_task(
-                e.run_video_face_swap,
-                self.video_source.text(),
-                self.video_target.text(),
-                self.task_callback
-            )
-
-        except Exception as exc:
-
-            self.warning("Video face swap", exc)
-
-    # --------------------------------------------------------
-    # VIDEO STUDIO
-    # --------------------------------------------------------
-
-    def page_video(self):
-
-        page = StudioPage(
-            "Video Studio",
-            "Video generation can be demanding on a 6 GB GPU. Start with modest frame counts."
-        )
-
-        box, form = self.card(
-            "ANIMATEDIFF",
-            "Animate a still image with a motion adapter."
-        )
-
-        self.anim_model = FilePicker(
-            "Models (*.safetensors *.ckpt)"
-        )
-
-        self.anim_motion = FilePicker(
-            "Models (*.safetensors *.ckpt)"
-        )
-
-        self.anim_image = FilePicker(
-            "Images (*.png *.jpg *.jpeg *.webp)"
-        )
-
-        self.anim_prompt = QLineEdit()
-        self.anim_prompt.setPlaceholderText("Motion prompt")
-
-        self.anim_negative = QLineEdit()
-        self.anim_negative.setPlaceholderText("Negative prompt")
-
-        self.anim_steps = QSpinBox()
-        self.anim_steps.setRange(1, 50)
-        self.anim_steps.setValue(15)
-
-        self.anim_cfg = QDoubleSpinBox()
-        self.anim_cfg.setRange(1, 20)
-        self.anim_cfg.setValue(7)
-
-        self.anim_frames = QSpinBox()
-        self.anim_frames.setRange(4, 32)
-        self.anim_frames.setValue(16)
-
-        self.anim_fps = QSpinBox()
-        self.anim_fps.setRange(4, 30)
-        self.anim_fps.setValue(8)
-
-        form.addRow("Base model", self.anim_model)
-        form.addRow("Motion adapter", self.anim_motion)
-        form.addRow("Initial image", self.anim_image)
-        form.addRow("Prompt", self.anim_prompt)
-        form.addRow("Negative prompt", self.anim_negative)
-        form.addRow("Steps", self.anim_steps)
-        form.addRow("CFG", self.anim_cfg)
-        form.addRow("Frames", self.anim_frames)
-        form.addRow("FPS", self.anim_fps)
-
-        run = QPushButton("Generate AnimateDiff")
-        run.clicked.connect(self.run_animatediff)
-
-        form.addRow(run)
-
-        page.body.addWidget(box)
-
-        svd, sf = self.card(
-            "STABLE VIDEO DIFFUSION",
-            "Generate a video from an image."
-        )
-
-        self.svd_image = FilePicker(
-            "Images (*.png *.jpg *.jpeg *.webp)"
-        )
-
-        self.svd_notes = QLineEdit()
-        self.svd_notes.setPlaceholderText("Motion description")
-
-        self.svd_duration = QDoubleSpinBox()
-        self.svd_duration.setRange(1, 10)
-        self.svd_duration.setValue(3)
-
-        self.svd_fps = QSpinBox()
-        self.svd_fps.setRange(4, 30)
-        self.svd_fps.setValue(8)
-
-        self.svd_steps = QSpinBox()
-        self.svd_steps.setRange(1, 50)
-        self.svd_steps.setValue(20)
-
-        sf.addRow("Input image", self.svd_image)
-        sf.addRow("Motion notes", self.svd_notes)
-        sf.addRow("Duration (seconds)", self.svd_duration)
-        sf.addRow("FPS", self.svd_fps)
-        sf.addRow("Steps", self.svd_steps)
-
-        run_svd = QPushButton("Generate SVD video")
-        run_svd.clicked.connect(self.run_svd)
-
-        sf.addRow(run_svd)
-
-        page.body.addWidget(svd)
-
-        return page
-
-    def run_animatediff(self):
-
-        try:
-
-            e = self.backend()
-
-            self.required(
-                self.anim_model.text(),
-                self.anim_motion.text(),
-                self.anim_image.text(),
-                self.anim_prompt.text()
-            )
-
-            self.start_task(
-                e.make_animatediff,
-                self.model_relative(self.anim_model.text()),
-                self.model_relative(self.anim_motion.text()),
-                self.anim_prompt.text(),
-                self.anim_negative.text(),
-                self.anim_steps.value(),
-                self.anim_cfg.value(),
-                self.anim_frames.value(),
-                self.anim_fps.value(),
-                self.anim_image.text(),
-                self.task_callback
-            )
-
-        except Exception as exc:
-
-            self.warning("AnimateDiff", exc)
-
-    def run_svd(self):
-
-        try:
-
-            e = self.backend()
-            self.required(self.svd_image.text())
-
-            self.start_task(
-                e.make_svd_video,
-                self.svd_image.text(),
-                self.svd_notes.text(),
-                "",
-                self.svd_duration.value(),
-                self.svd_fps.value(),
-                127,
-                0.02,
-                20,
-                4,
-                self.task_callback,
-                -1
-            )
-
-        except Exception as exc:
-
-            self.warning("SVD", exc)
-
-    # --------------------------------------------------------
-    # CONTROLNET
-    # --------------------------------------------------------
-
-    def page_controlnet(self):
-
-        page = StudioPage(
-            "ControlNet",
-            "Canny, Depth, OpenPose and Tile."
-        )
-
-        box, form = self.card(
-            "CONTROLNET GENERATION",
-            "Uses run_controlnet_mode() from app.py."
-        )
-
-        self.cn_mode = QComboBox()
-        self.cn_mode.addItems([
-            "canny",
-            "depth",
-            "openpose",
-            "tile"
-        ])
-
-        self.cn_base = QLineEdit()
-        self.cn_base.setPlaceholderText(
-            "Base model path relative to models"
-        )
-
-        self.cn_control = QLineEdit()
-        self.cn_control.setPlaceholderText(
-            "Control model path relative to models"
-        )
-
-        self.cn_image = FilePicker(
-            "Images (*.png *.jpg *.jpeg *.webp)"
-        )
-
-        self.cn_prompt = QTextEdit()
-        self.cn_prompt.setFixedHeight(80)
-
-        self.cn_negative = QLineEdit()
-
-        self.cn_steps = QSpinBox()
-        self.cn_steps.setRange(1, 80)
-        self.cn_steps.setValue(25)
-
-        self.cn_cfg = QDoubleSpinBox()
-        self.cn_cfg.setRange(0.1, 30)
-        self.cn_cfg.setValue(7)
-
-        self.cn_strength = QDoubleSpinBox()
-        self.cn_strength.setRange(0.01, 1)
-        self.cn_strength.setValue(0.8)
-
-        form.addRow("Mode", self.cn_mode)
-        form.addRow("Base model", self.cn_base)
-        form.addRow("Control model", self.cn_control)
-        form.addRow("Input image", self.cn_image)
-        form.addRow("Prompt", self.cn_prompt)
-        form.addRow("Negative prompt", self.cn_negative)
-        form.addRow("Steps", self.cn_steps)
-        form.addRow("CFG", self.cn_cfg)
-        form.addRow("Strength", self.cn_strength)
-
-        run = QPushButton("Run ControlNet")
-        run.clicked.connect(self.run_controlnet)
-
-        form.addRow(run)
-
-        page.body.addWidget(box)
-
-        return page
-
-    def run_controlnet(self):
-
-        try:
-
-            e = self.backend()
-
-            self.required(
-                self.cn_base.text(),
-                self.cn_control.text(),
-                self.cn_image.text(),
-                self.cn_prompt.toPlainText()
-            )
-
-            self.start_task(
-                e.run_controlnet_mode,
-                self.cn_mode.currentText(),
-                self.model_relative(self.cn_base.text()),
-                self.model_relative(self.cn_control.text()),
-                self.cn_image.text(),
-                self.cn_prompt.toPlainText(),
-                self.cn_negative.text(),
-                self.cn_steps.value(),
-                self.cn_cfg.value(),
-                self.cn_strength.value(),
-                self.task_callback
-            )
-
-        except Exception as exc:
-
-            self.warning("ControlNet", exc)
-
-    # --------------------------------------------------------
-    # VOICE STUDIO
-    # --------------------------------------------------------
-
-    def page_voice(self):
-
-        page = StudioPage(
-            "Voice Studio",
-            "Local Piper synthesis and RVC conversion."
-        )
-
-        piper, pf = self.card(
-            "PIPER TEXT TO SPEECH",
-            "Synthesize speech using a local Piper model."
-        )
-
-        self.piper_text = QTextEdit()
-        self.piper_text.setFixedHeight(100)
-
-        self.piper_model = FilePicker(
-            "Piper models (*.onnx)"
-        )
-
-        pf.addRow("Text", self.piper_text)
-        pf.addRow("Voice model", self.piper_model)
-
-        run = QPushButton("Synthesize speech")
-        run.clicked.connect(self.run_piper)
-
-        pf.addRow(run)
-
-        page.body.addWidget(piper)
-
-        rvc, rf = self.card(
-            "RVC VOICE CONVERSION",
-            "Convert an audio file using an RVC model."
-        )
-
-        self.rvc_audio = FilePicker(
-            "Audio (*.wav *.mp3 *.flac *.ogg *.m4a)"
-        )
-
-        self.rvc_model = FilePicker(
-            "RVC models (*.pth)"
-        )
-
-        self.rvc_index = FilePicker(
-            "Index files (*.index)"
-        )
-
-        rf.addRow("Audio input", self.rvc_audio)
-        rf.addRow("Model", self.rvc_model)
-        rf.addRow("Index", self.rvc_index)
-
-        convert = QPushButton("Run RVC conversion")
-        convert.clicked.connect(self.run_rvc)
-
-        rf.addRow(convert)
-
-        page.body.addWidget(rvc)
-
-        return page
-
-    def run_piper(self):
-
-        try:
-
-            e = self.backend()
-
-            self.required(
-                self.piper_text.toPlainText(),
-                self.piper_model.text()
-            )
-
-            self.start_task(
-                e.synthesize_voice_piper,
-                self.piper_text.toPlainText(),
-                self.piper_model.text(),
-                self.task_callback
-            )
-
-        except Exception as exc:
-
-            self.warning("Piper", exc)
-
-    def run_rvc(self):
-
-        try:
-
-            e = self.backend()
-
-            self.required(
-                self.rvc_audio.text(),
-                self.rvc_model.text(),
-                self.rvc_index.text()
-            )
-
-            self.start_task(
-                e.run_rvc_conversion,
-                self.rvc_audio.text(),
-                self.rvc_model.text(),
-                self.rvc_index.text(),
-                self.task_callback
-            )
-
-        except Exception as exc:
-
-            self.warning("RVC", exc)
-
-    # --------------------------------------------------------
-    # LIP SYNC
-    # --------------------------------------------------------
-
-    def page_lipsync(self):
-
-        page = StudioPage(
-            "Lip Sync",
-            "Synchronize a face video with an audio track."
-        )
-
-        box, form = self.card(
-            "AUDIO DRIVEN LIP SYNC",
-            "Uses create_lipsync_video() from app.py."
-        )
-
-        self.lip_video = FilePicker(
-            "Videos (*.mp4 *.mov *.mkv *.avi)"
-        )
-
-        self.lip_audio = FilePicker(
-            "Audio (*.wav *.mp3 *.flac *.ogg *.m4a)"
-        )
-
-        form.addRow("Face video", self.lip_video)
-        form.addRow("Audio", self.lip_audio)
-
-        run = QPushButton("Create lip-sync video")
-        run.clicked.connect(self.run_lipsync)
-
-        form.addRow(run)
-
-        page.body.addWidget(box)
-
-        return page
-
-    def run_lipsync(self):
-
-        try:
-
-            e = self.backend()
-
-            self.required(
-                self.lip_video.text(),
-                self.lip_audio.text()
-            )
-
-            self.start_task(
-                e.create_lipsync_video,
-                self.lip_video.text(),
-                self.lip_audio.text(),
-                self.task_callback
-            )
-
-        except Exception as exc:
-
-            self.warning("Lip Sync", exc)
-
-    # --------------------------------------------------------
-    # TIMELINE
-    # --------------------------------------------------------
-
-    def page_timeline(self):
-
-        page = StudioPage(
-            "Timeline",
-            "Combine media files using the existing FFmpeg exporter."
-        )
-
-        box, form = self.card(
-            "TIMELINE EXPORT",
-            "Enter one media file path per line in sequence order."
-        )
-
-        self.timeline_items = QTextEdit()
-        self.timeline_items.setFixedHeight(120)
-
-        self.timeline_items.setPlaceholderText(
-            "E:\\AIExoticLocal\\output_media\\clip1.mp4\n"
-            "E:\\AIExoticLocal\\output_media\\clip2.mp4"
-        )
-
-        self.timeline_output = FilePicker(
-            "MP4 video (*.mp4)",
-            save=True
-        )
-
-        self.timeline_audio = FilePicker(
-            "Audio (*.wav *.mp3 *.flac *.m4a)"
-        )
-
-        self.timeline_fps = QSpinBox()
-        self.timeline_fps.setRange(1, 60)
-        self.timeline_fps.setValue(30)
-
-        form.addRow("Media files", self.timeline_items)
-        form.addRow("Output file", self.timeline_output)
-        form.addRow("Optional audio", self.timeline_audio)
-        form.addRow("FPS", self.timeline_fps)
-
-        run = QPushButton("Export timeline")
-        run.clicked.connect(self.run_timeline)
-
-        form.addRow(run)
-
-        page.body.addWidget(box)
-
-        return page
-
-    def run_timeline(self):
-
-        try:
-
-            e = self.backend()
-
-            items = [
-                line.strip().strip('"')
-                for line in self.timeline_items.toPlainText().splitlines()
-                if line.strip()
-            ]
-
-            self.required(
-                *items,
-                self.timeline_output.text()
-            )
-
-            self.start_task(
-                e.export_timeline,
-                items,
-                self.timeline_output.text(),
-                self.timeline_audio.text() or None,
-                self.timeline_fps.value()
-            )
-
-        except Exception as exc:
-
-            self.warning("Timeline", exc)
-
-    # --------------------------------------------------------
-    # TASK EXECUTION
-    # --------------------------------------------------------
-
-    def task_callback(self, *args):
-
-        message = " ".join(
-            str(x) for x in args
-            if x is not None
-        )
-
-        if message:
-            self.worker_log.emit(message)
-
-    def start_task(self, function, *args, **kwargs):
-
-        if self.thread is not None and self.thread.isRunning():
-
-            QMessageBox.information(
-                self,
-                "AETHER is busy",
-                "Wait until the current task finishes."
-            )
-
-            return
-
-        self.progress.setValue(0)
-        self.progress_label.setText("Working...")
-        self.status_badge.setText("RUNNING")
-
-        self.log(
-            "Starting: " + function.__name__
-        )
-
-        self.thread = QThread(self)
-
-        self.worker = Worker(
-            function,
-            *args,
-            **kwargs
-        )
-
-        self.worker.moveToThread(self.thread)
-
-        self.thread.started.connect(
-            self.worker.run
-        )
-
-        self.worker.message.connect(
-            self.log
-        )
-
-        self.worker.finished.connect(
-            self.task_finished
-        )
-
-        self.worker.failed.connect(
-            self.task_failed
-        )
-
-        self.worker.finished.connect(
-            self.thread.quit
-        )
-
-        self.worker.failed.connect(
-            self.thread.quit
-        )
-
-        self.thread.finished.connect(
-            self.thread_finished
-        )
-
-        self.thread.start()
-
-    def thread_finished(self):
-
-        self.thread = None
-        self.worker = None
-
-    def task_finished(self, result):
-
-        self.progress.setValue(100)
-        self.progress_label.setText("Completed")
-        self.status_badge.setText("READY")
-
-        if result is not None:
-
-            self.log(
-                "Result: " + str(result)
-            )
-
-        self.refresh_preview()
-
-    def task_failed(self, error):
-
-        self.progress_label.setText("Failed")
-        self.status_badge.setText("ERROR")
-
-        self.log(error)
-
-        QMessageBox.critical(
-            self,
-            "Task failed",
-            error[-3500:]
-        )
-
-    def warning(self, title, error):
-
-        QMessageBox.warning(
-            self,
-            title,
-            str(error)
-        )
-
-    def log(self, message):
-
-        self.log_box.append(str(message))
-
-        self.progress_label.setText(
-            str(message).splitlines()[-1][:120]
-        )
-
-    # --------------------------------------------------------
-    # STATUS
-    # --------------------------------------------------------
-
-    def refresh_status(self):
-
-        if engine is None:
-
-            self.engine_status.setText(
-                "ENGINE: IMPORT ERROR"
-            )
-
-            self.gpu_status.setText(
-                "GPU: unavailable"
-            )
-
-            if hasattr(self, "overview_info"):
-
-                self.overview_info.setText(
-                    "Backend import error:\n"
-                    + str(ENGINE_ERROR)
-                )
-
-            return
-
-        self.engine_status.setText(
-            "ENGINE: CONNECTED"
-        )
-
-        gpu = "CPU"
-
-        try:
-
-            import torch
-
-            if torch.cuda.is_available():
-
-                gpu = torch.cuda.get_device_name(0)
-
-                memory = (
-                    torch.cuda.get_device_properties(0)
-                    .total_memory / (1024 ** 3)
-                )
-
-                gpu += f" ({memory:.1f} GB)"
-
-        except Exception:
-            pass
-
-        self.gpu_status.setText(
-            "GPU: " + gpu
-        )
-
-        if hasattr(self, "overview_info"):
-
-            self.overview_info.setText(
-                "Interface: PySide6\n"
-                f"Backend: {Path(engine.__file__).name}\n"
-                f"Models: {MODELS_DIR}\n"
-                f"Output: {OUTPUT_DIR}\n"
-                "GFPGAN: existing backend function\n"
-                "Real-ESRGAN: existing backend function\n"
-                "FaceFusion: not connected"
-            )
-
-    # --------------------------------------------------------
-    # PREVIEW
-    # --------------------------------------------------------
-
-    def refresh_preview(self):
-
-        if not hasattr(self, "image_preview"):
-            return
-
-        images = []
-
-        try:
-
-            images = sorted(
-                [
-                    p for p in OUTPUT_DIR.iterdir()
-                    if p.suffix.lower() in {
-                        ".png", ".jpg", ".jpeg", ".webp"
-                    }
-                ],
-                key=lambda p: p.stat().st_mtime,
-                reverse=True
-            )
-
-        except Exception:
-            pass
-
-        if not images:
-
-            self.image_preview.setText(
-                "No generated images yet."
-            )
-
-            return
-
-        pixmap = QPixmap(str(images[0]))
-
-        if pixmap.isNull():
-            return
-
-        scaled = pixmap.scaled(
-            QSize(850, 350),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
+        self.navigation.currentRowChanged.connect(
+            self.stack.setCurrentIndex
         )
-
-        self.image_preview.setPixmap(scaled)
-
-        if hasattr(self, "restore_preview"):
-
-            self.restore_preview.setPixmap(
-                pixmap.scaled(
-                    QSize(750, 260),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
-            )
-
-    # --------------------------------------------------------
-    # OUTPUT
-    # --------------------------------------------------------
-
-    def open_output(self):
-
-        try:
-
-            if sys.platform == "win32":
-
-                os.startfile(str(OUTPUT_DIR))
-
-            else:
-
-                subprocess.Popen([
-                    "xdg-open",
-                    str(OUTPUT_DIR)
-                ])
-
-        except Exception as exc:
-
-            self.warning("Output folder", exc)
-
-
-# ------------------------------------------------------------
-# THEME
-# ------------------------------------------------------------
-
-def apply_theme(application):
 
-    application.setStyle("Fusion")
+        self.navigation.setCurrentRow(0)
 
-    application.setFont(
-        QFont("Segoe UI", 10)
-    )
+        self.setStyleSheet(self._stylesheet())
 
-    application.setStyleSheet("""
+    def _stylesheet(self):
+        return """
         QWidget {
-            background: #11151d;
-            color: #e8edf5;
+            background: #101522;
+            color: #e5eaf5;
+            font-family: Segoe UI;
+            font-size: 10pt;
         }
 
-        QMainWindow {
-            background: #0d1118;
+        QLabel#MainTitle {
+            font-size: 24pt;
+            font-weight: 800;
+            color: #ffffff;
         }
 
-        QMenuBar {
-            background: #11151d;
-            color: #dce5f2;
+        QLabel#Subtitle {
+            color: #8190ac;
+            font-size: 9pt;
+        }
+
+        QLabel#StatusLabel {
+            color: #8da2c5;
             padding: 5px;
         }
 
-        QMenu {
-            background: #171e29;
-            border: 1px solid #2a3545;
+        QListWidget#Navigation {
+            background: #151d2d;
+            border: 1px solid #27344b;
+            border-radius: 12px;
+            padding: 8px;
+            outline: none;
         }
 
-        #sidebar {
-            background: #0b1017;
-            border-right: 1px solid #222c3a;
+        QListWidget#Navigation::item {
+            min-height: 42px;
+            padding: 8px;
+            border-radius: 7px;
+            margin: 2px;
         }
 
-        #brand {
-            color: #f2f6ff;
-            font-size: 27px;
-            font-weight: 800;
-            letter-spacing: 3px;
-        }
-
-        #brandSub {
-            color: #8194ad;
-            font-size: 9px;
-            letter-spacing: 2px;
-        }
-
-        #navButton {
-            text-align: left;
-            padding: 12px;
-            border: 0;
-            border-radius: 8px;
-            color: #aab8ca;
-            background: transparent;
-        }
-
-        #navButton:hover {
-            background: #182333;
+        QListWidget#Navigation::item:selected {
+            background: #294b79;
             color: white;
         }
 
-        #navButton[active="true"] {
-            background: #1d3046;
-            color: #80c7ff;
-            font-weight: 700;
-        }
-
-        #sideStatus {
-            color: #8194ad;
-            font-size: 10px;
-        }
-
-        #topbar {
-            background: #111720;
-            border-bottom: 1px solid #222c3a;
-        }
-
-        #topTitle {
-            font-size: 13px;
-            font-weight: 700;
-        }
-
-        #readyPill {
-            color: #7ee0b1;
-            background: #173328;
-            border-radius: 10px;
-            padding: 5px 12px;
-            font-size: 10px;
-            font-weight: 700;
-        }
-
-        #pageTitle {
-            color: #f4f7fc;
-            font-size: 27px;
-            font-weight: 750;
-        }
-
-        #subtitle {
-            color: #8e9db1;
-            font-size: 12px;
-        }
-
         QGroupBox {
-            border: 1px solid #2a3545;
-            border-radius: 11px;
-            margin-top: 10px;
-            padding: 13px;
-            background: #171e29;
+            background: #151d2d;
+            border: 1px solid #293750;
+            border-radius: 10px;
+            margin-top: 14px;
+            padding: 14px;
             font-weight: 700;
         }
 
         QGroupBox::title {
             subcontrol-origin: margin;
             left: 12px;
-            padding: 0 5px;
-            color: #9fcfff;
+            padding: 0 6px;
+            color: #9dc7ff;
         }
 
-        QLabel#muted {
-            color: #8e9db1;
-            font-size: 11px;
-            font-weight: 400;
-        }
-
-        #smallHeading {
-            color: #9eb1c8;
-            font-size: 10px;
-            font-weight: 800;
-        }
-
-        #bottomPanel {
-            background: #0d121a;
-            border-top: 1px solid #222c3a;
-        }
-
-        QTextEdit,
-        QLineEdit,
-        QComboBox,
-        QSpinBox,
-        QDoubleSpinBox {
-            background: #0e141d;
-            border: 1px solid #303d4e;
+        QLineEdit, QTextEdit, QComboBox,
+        QSpinBox, QDoubleSpinBox {
+            background: #0e1625;
+            border: 1px solid #33425c;
             border-radius: 6px;
             padding: 8px;
-            color: #eaf0f8;
+            min-height: 22px;
+            selection-background-color: #3266a5;
         }
 
-        QTextEdit:focus,
-        QLineEdit:focus,
-        QComboBox:focus {
-            border: 1px solid #4c9bd2;
+        QTextEdit {
+            min-height: 75px;
         }
 
         QPushButton {
-            background: #2779b9;
-            border: 0;
+            background: #254d7d;
+            border: 1px solid #3c6da6;
             border-radius: 7px;
-            color: white;
-            padding: 10px 16px;
-            font-weight: 700;
+            padding: 10px 12px;
+            min-height: 24px;
+            font-weight: 600;
         }
 
         QPushButton:hover {
-            background: #348dce;
+            background: #32649c;
         }
 
-        QPushButton#secondary {
-            background: #263447;
-            color: #cbd8e8;
+        QPushButton:pressed {
+            background: #1b385c;
         }
 
-        QPushButton#secondary:hover {
-            background: #34485f;
-        }
-
-        QCheckBox {
-            color: #aebdd0;
-            spacing: 8px;
+        QPushButton:disabled {
+            background: #303846;
+            color: #788398;
         }
 
         QProgressBar {
-            background: #202a37;
-            border: 0;
-            border-radius: 2px;
+            background: #182235;
+            border: 1px solid #34445e;
+            border-radius: 6px;
+            height: 14px;
+            text-align: center;
         }
 
         QProgressBar::chunk {
-            background: #42a5e8;
-            border-radius: 2px;
+            background: #3984d6;
+            border-radius: 5px;
         }
 
-        #preview {
-            background: #0b1017;
-            border: 1px dashed #3a4b60;
-            border-radius: 8px;
-            color: #71839a;
-            padding: 10px;
+        QScrollArea {
+            border: none;
         }
 
-        #warningText {
-            color: #f0c477;
-            font-weight: 700;
+        QCheckBox {
+            spacing: 8px;
+            padding: 5px;
         }
-    """)
 
+        QSlider::groove:horizontal {
+            height: 6px;
+            background: #293750;
+        }
 
-# ------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------
+        QSlider::handle:horizontal {
+            background: #5ba4f5;
+            width: 15px;
+            margin: -5px 0;
+            border-radius: 7px;
+        }
+        """
 
-def main():
+    def _avatar_icon(self):
+        pixmap = QPixmap(40, 40)
+        pixmap.fill(Qt.transparent)
 
-    application = QApplication(sys.argv)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
 
-    apply_theme(application)
+        painter.setBrush(QColor("#28588a"))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(2, 2, 36, 36)
 
-    window = AetherStudio()
-    window.show()
+        painter.setBrush(QColor("#f0c5a0"))
+        painter.drawEllipse(13, 8, 14, 14)
 
-    if engine is None:
+        painter.setBrush(QColor("#d9e9ff"))
+        painter.drawEllipse(8, 23, 24, 17)
 
-        QMessageBox.critical(
-            window,
-            "Backend error",
-            "Could not import app.py:\n"
-            + str(ENGINE_ERROR)
+        painter.end()
+
+        return QIcon(pixmap)
+
+    def _create_pages(self):
+        definitions = [
+            ("🎨  Image Studio", "image"),
+            ("🖌  AI Canvas / Edit", "canvas"),
+            ("Character Studio", "character"),
+            ("🎬  Scene Studio", "scene"),
+            ("🎞  Motion / Video", "video"),
+            ("✂  Timeline / Export", "timeline"),
+            ("⚙  ComfyUI Bridge", "comfy"),
+            ("👤  Face Studio", "face"),
+            ("✨  Enhancement", "enhance"),
+            ("◈  ControlNet", "control"),
+            ("🎙  Voice Studio", "voice"),
+            ("🖥  Model / System", "system"),
+        ]
+
+        for label, key in definitions:
+            page = self._new_page(key)
+            item = QListWidgetItem(label)
+
+            if key == "character":
+                item.setIcon(self._avatar_icon())
+                item.setText("  Character Studio")
+
+            self.navigation.addItem(item)
+            self.stack.addWidget(page)
+            self.pages[key] = page
+
+        self._build_image_page()
+        self._build_canvas_page()
+        self._build_character_page()
+        self._build_scene_page()
+        self._build_video_page()
+        self._build_timeline_page()
+        self._build_comfy_page()
+        self._build_face_page()
+        self._build_enhance_page()
+        self._build_control_page()
+        self._build_voice_page()
+        self._build_system_page()
+
+    def _new_page(self, key):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(22, 18, 22, 24)
+        layout.setSpacing(14)
+
+        scroll.setWidget(content)
+        scroll.body = layout
+
+        return scroll
+
+    def _heading(self, key, title, description):
+        body = self.pages[key].body
+
+        heading = QLabel(title)
+        heading.setStyleSheet(
+            "font-size:19pt;font-weight:800;color:#ffffff;"
         )
 
-    sys.exit(application.exec())
+        desc = QLabel(description)
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color:#91a1bd;")
+
+        body.addWidget(heading)
+        body.addWidget(desc)
+
+    def _group(self, key, title):
+        group = QGroupBox(title)
+        layout = QFormLayout(group)
+        layout.setLabelAlignment(Qt.AlignLeft)
+        layout.setHorizontalSpacing(18)
+        layout.setVerticalSpacing(12)
+        self.pages[key].body.addWidget(group)
+        return layout
+
+    def _line(self, form, key, label, default=""):
+        widget = QLineEdit(str(default))
+        widget.setClearButtonEnabled(True)
+        form.addRow(label, widget)
+        self.fields[key] = widget
+        return widget
+
+    def _text(self, form, key, label, default="", height=100):
+        widget = QTextEdit()
+        widget.setPlainText(default)
+        widget.setMinimumHeight(height)
+        form.addRow(label, widget)
+        self.fields[key] = widget
+        return widget
+
+    def _combo(self, form, key, label, values, default=None):
+        widget = QComboBox()
+        widget.addItems([str(x) for x in values])
+
+        if default is not None:
+            index = widget.findText(str(default))
+            if index >= 0:
+                widget.setCurrentIndex(index)
+
+        form.addRow(label, widget)
+        self.fields[key] = widget
+        return widget
+
+    def _file(self, form, key, label, filters="All files (*)"):
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        edit = QLineEdit()
+        edit.setPlaceholderText("Выбери файл...")
+        browse = QPushButton("Browse")
+
+        browse.setMaximumWidth(105)
+        browse.clicked.connect(
+            lambda: self._browse(edit, filters)
+        )
+
+        layout.addWidget(edit, 1)
+        layout.addWidget(browse)
+
+        form.addRow(label, row)
+        self.fields[key] = edit
+
+        return edit
+
+    def _browse(self, edit, filters):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select file",
+            str(engine.ROOT),
+            filters
+        )
+
+        if path:
+            edit.setText(path)
+
+    def _button(self, key, label, callback, parent=None):
+        button = QPushButton(label)
+        button.setMinimumHeight(44)
+        button.setSizePolicy(
+            button.sizePolicy().horizontalPolicy(),
+            button.sizePolicy().verticalPolicy()
+        )
+        button.clicked.connect(callback)
+
+        self.pages[key].body.addWidget(button)
+        return button
+
+    def _checkbox(self, form, key, label, default=False):
+        widget = QCheckBox(label)
+        widget.setChecked(default)
+        form.addRow(widget)
+        self.fields[key] = widget
+        return widget
+
+    def value(self, key, default=""):
+        widget = self.fields.get(key)
+
+        if widget is None:
+            return default
+
+        if isinstance(widget, QTextEdit):
+            return widget.toPlainText().strip()
+
+        if isinstance(widget, QCheckBox):
+            return widget.isChecked()
+
+        return widget.text().strip() if isinstance(widget, QLineEdit) else widget.currentText()
+
+    def number(self, key, default, cast=int):
+        try:
+            return cast(self.value(key, str(default)))
+        except Exception:
+            raise ValueError(
+                f"Неверное числовое значение: {key}"
+            )
+
+    def relative(self, path):
+        if not path:
+            return None
+
+        p = Path(path)
+
+        try:
+            return str(p.resolve().relative_to(engine.ROOT.resolve()))
+        except Exception:
+            return str(p)
+
+    def _model_values(self):
+        return engine.list_checkpoints()
+
+    def _add_model_combo(self, form, key="model"):
+        values = self._model_values()
+
+        combo = self._combo(
+            form,
+            key,
+            "Checkpoint",
+            values
+        )
+
+        if values:
+            preferred = getattr(
+                engine,
+                "PREFERRED_CHECKPOINT",
+                ""
+            )
+
+            index = combo.findText(preferred)
+
+            if index >= 0:
+                combo.setCurrentIndex(index)
+
+        return combo
+
+    # ---------------------------------------------------------
+    # IMAGE STUDIO
+    # ---------------------------------------------------------
+
+    def _build_image_page(self):
+        self._heading(
+            "image",
+            "IMAGE STUDIO",
+            "Локальная генерация изображений, дополнительные компоненты и управление seed."
+        )
+
+        form = self._group("image", "Generation")
+
+        self._add_model_combo(form, "image_model")
+
+        self._text(
+            form,
+            "image_prompt",
+            "Prompt",
+            "cinematic portrait, detailed realistic lighting, high quality",
+            120
+        )
+
+        self._text(
+            form,
+            "image_negative",
+            "Negative prompt",
+            "blurry, low quality, artifacts, deformed anatomy, extra fingers",
+            75
+        )
+
+        self._line(form, "image_steps", "Steps", "25")
+        self._line(form, "image_cfg", "CFG", "6.5")
+        self._line(form, "image_width", "Width", "768")
+        self._line(form, "image_height", "Height", "768")
+        self._line(form, "image_seed", "Seed (-1 = random)", "-1")
+
+        optional = self._group("image", "Optional components")
+
+        self._combo(
+            optional,
+            "image_lora",
+            "LoRA",
+            [""] + [
+                str(p.relative_to(engine.ROOT))
+                for p in engine.component_files("lora")
+            ]
+        )
+
+        self._line(optional, "image_lora_scale", "LoRA scale", "0.8")
+
+        self._combo(
+            optional,
+            "image_vae",
+            "VAE",
+            [""] + [
+                str(p.relative_to(engine.ROOT))
+                for p in engine.component_files("vae")
+            ]
+        )
+
+        self._combo(
+            optional,
+            "image_embedding",
+            "Embedding",
+            [""] + [
+                str(p.relative_to(engine.ROOT))
+                for p in engine.component_files("embedding")
+            ]
+        )
+
+        self._combo(
+            optional,
+            "image_ip",
+            "IP-Adapter",
+            [""] + [
+                str(p.relative_to(engine.ROOT))
+                for p in engine.component_files("ip_adapter")
+            ]
+        )
+
+        self._file(
+            optional,
+            "image_ip_reference",
+            "IP-Adapter reference",
+            "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+
+        self._button(
+            "image",
+            "GENERATE IMAGE",
+            self.generate_image
+        )
+
+        self._button(
+            "image",
+            "Refresh checkpoint list",
+            self.refresh_models
+        )
+
+    def generate_image(self):
+        model = self.value("image_model")
+        if not model:
+            return self.warning("Image Studio", "Нет доступных checkpoints.")
+
+        prompt = self.value("image_prompt")
+        if not prompt:
+            return self.warning("Image Studio", "Введи prompt.")
+
+        try:
+            steps = self.number("image_steps", 25)
+            cfg = self.number("image_cfg", 6.5, float)
+            width = self.number("image_width", 768)
+            height = self.number("image_height", 768)
+            seed = self.number("image_seed", -1)
+
+            if not 1 <= steps <= 100:
+                raise ValueError("Steps: 1–100.")
+
+            if not 1 <= cfg <= 30:
+                raise ValueError("CFG: 1–30.")
+
+            if not 256 <= width <= 2048 or not 256 <= height <= 2048:
+                raise ValueError("Размер: 256–2048.")
+
+        except Exception as exc:
+            return self.warning("Parameters", str(exc))
+
+        model = self.relative(model)
+
+        lora = self.value("image_lora") or None
+        vae = self.value("image_vae") or None
+        embedding = self.value("image_embedding") or None
+        ip = self.value("image_ip") or None
+
+        reference = self.value("image_ip_reference") or None
+        negative = self.value("image_negative")
+        lora_scale = self.number("image_lora_scale", 0.8, float)
+
+        def job(callback):
+            engine.run_generation(
+                "txt2img",
+                model,
+                prompt,
+                negative,
+                None,
+                None,
+                steps,
+                cfg,
+                0.0,
+                width,
+                height,
+                seed,
+                callback,
+                lora_rel=lora,
+                lora_scale=lora_scale,
+                vae_rel=vae,
+                embedding_rel=embedding,
+                ip_adapter_rel=ip,
+                ip_image_path=reference
+            )
+
+        self.start_task("Image generation", job)
+
+    # ---------------------------------------------------------
+    # AI CANVAS
+    # ---------------------------------------------------------
+
+    def _build_canvas_page(self):
+        self._heading(
+            "canvas",
+            "AI CANVAS / EDIT",
+            "Рисуй маску поверх изображения и используй Inpaint, Outpaint или Image-to-Image."
+        )
+
+        form = self._group("canvas", "Source and generation")
+
+        self._add_model_combo(form, "canvas_model")
+
+        self._text(
+            form,
+            "canvas_prompt",
+            "Edit prompt",
+            "replace only the selected area, preserve the rest of the image",
+            100
+        )
+
+        self._text(
+            form,
+            "canvas_negative",
+            "Negative prompt",
+            "blurry, artifacts, deformed anatomy",
+            65
+        )
+
+        self._line(form, "canvas_steps", "Steps", "25")
+        self._line(form, "canvas_cfg", "CFG", "6.5")
+        self._line(form, "canvas_strength", "Strength", "0.35")
+
+        row = QHBoxLayout()
+
+        self.canvas_path = QLineEdit()
+        self.canvas_path.setPlaceholderText("Source image")
+
+        browse = QPushButton("Open image")
+        browse.clicked.connect(self.open_canvas_image)
+
+        row.addWidget(self.canvas_path, 1)
+        row.addWidget(browse)
+
+        self.pages["canvas"].body.addLayout(row)
+
+        self.canvas_widget = MaskCanvas()
+        self.pages["canvas"].body.addWidget(self.canvas_widget)
+
+        brush_row = QHBoxLayout()
+
+        brush_row.addWidget(QLabel("Brush size"))
+
+        self.brush_slider = QSlider(Qt.Horizontal)
+        self.brush_slider.setRange(5, 160)
+        self.brush_slider.setValue(35)
+        self.brush_slider.valueChanged.connect(
+            self.set_brush
+        )
+
+        brush_row.addWidget(self.brush_slider)
+
+        clear = QPushButton("Clear mask")
+        clear.clicked.connect(
+            self.canvas_widget.clear_mask
+        )
+
+        brush_row.addWidget(clear)
+        self.pages["canvas"].body.addLayout(brush_row)
+
+        self._button(
+            "canvas",
+            "INPAINT — edit masked area",
+            self.run_inpaint
+        )
+
+        self._button(
+            "canvas",
+            "OUTPAINT — expand image",
+            self.run_outpaint
+        )
+
+        self._button(
+            "canvas",
+            "IMAGE-TO-IMAGE",
+            self.run_img2img
+        )
+
+    def set_brush(self, value):
+        self.canvas_widget.brush_size = value
+        self.canvas_widget.update()
+
+    def open_canvas_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open image",
+            str(engine.OUTPUT),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp)"
+        )
+
+        if not path:
+            return
+
+        try:
+            self.canvas_widget.load_image(path)
+            self.canvas_path.setText(path)
+            self.log(f"Canvas source: {path}")
+        except Exception as exc:
+            self.warning("Canvas", str(exc))
+
+    def _canvas_args(self):
+        if self.canvas_widget.image is None:
+            raise RuntimeError("Открой исходное изображение.")
+
+        model = self.value("canvas_model")
+        if not model:
+            raise RuntimeError("Выбери checkpoint.")
+
+        prompt = self.value("canvas_prompt")
+        if not prompt:
+            raise RuntimeError("Введи prompt.")
+
+        return (
+            self.relative(model),
+            prompt,
+            self.value("canvas_negative"),
+            self.number("canvas_steps", 25),
+            self.number("canvas_cfg", 6.5, float),
+            self.number("canvas_strength", 0.35, float)
+        )
+
+    def run_inpaint(self):
+        try:
+            model, prompt, negative, steps, cfg, strength = self._canvas_args()
+
+            source = self.canvas_widget.image.copy()
+            mask = self.canvas_widget.get_mask()
+
+            if mask.getbbox() is None:
+                raise RuntimeError("Нарисуй маску.")
+
+        except Exception as exc:
+            return self.warning("Inpaint", str(exc))
+
+        self.start_task(
+            "Inpaint",
+            lambda cb: engine.run_generation(
+                "inpaint", model, prompt, negative,
+                source, mask, steps, cfg, strength,
+                0, 0, -1, cb
+            )
+        )
+
+    def run_img2img(self):
+        try:
+            model, prompt, negative, steps, cfg, strength = self._canvas_args()
+            source = self.canvas_widget.image.copy()
+        except Exception as exc:
+            return self.warning("Img2Img", str(exc))
+
+        self.start_task(
+            "Image to Image",
+            lambda cb: engine.run_generation(
+                "img2img", model, prompt, negative,
+                source, None, steps, cfg, strength,
+                0, 0, -1, cb
+            )
+        )
+
+    def run_outpaint(self):
+        try:
+            from PIL import Image, ImageDraw, ImageOps
+
+            model, prompt, negative, steps, cfg, strength = self._canvas_args()
+
+            source = self.canvas_widget.image.copy()
+            width, height = source.size
+
+            border = max(64, int(max(width, height) * 0.20))
+
+            expanded = ImageOps.expand(
+                source,
+                border=border,
+                fill=(0, 0, 0)
+            )
+
+            mask = Image.new("L", expanded.size, 255)
+
+            draw = ImageDraw.Draw(mask)
+            draw.rectangle(
+                (
+                    border,
+                    border,
+                    border + width - 1,
+                    border + height - 1
+                ),
+                fill=0
+            )
+
+        except Exception as exc:
+            return self.warning("Outpaint", str(exc))
+
+        self.start_task(
+            "Outpaint",
+            lambda cb: engine.run_generation(
+                "inpaint", model, prompt, negative,
+                expanded, mask, steps, cfg, strength,
+                0, 0, -1, cb
+            )
+        )
+
+    # ---------------------------------------------------------
+    # CHARACTER STUDIO
+    # ---------------------------------------------------------
+
+    def _build_character_page(self):
+        self._heading(
+            "character",
+            "CHARACTER STUDIO",
+            "Локальная библиотека персонажей. Сохраняй постоянные описания и reference images."
+        )
+
+        form = self._group("character", "Character profile")
+
+        self._line(form, "char_name", "Character name", "Character_01")
+
+        self._text(
+            form,
+            "char_prompt",
+            "Appearance / permanent prompt",
+            "fictional adult character, consistent facial features, hairstyle, eye color, body proportions, clothing style",
+            120
+        )
+
+        self._text(
+            form,
+            "char_negative",
+            "Permanent negative prompt",
+            "different face, inconsistent identity, distorted anatomy, extra fingers",
+            75
+        )
+
+        self._file(
+            form,
+            "char_reference",
+            "Reference image",
+            "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+
+        self._button("character", "SAVE CHARACTER", self.save_character)
+        self._button("character", "LOAD CHARACTER", self.load_character)
+        self._button("character", "USE PROMPT IN IMAGE STUDIO", self.use_character)
+
+        self.character_status = QLabel(
+            f"Profiles folder: {engine.CHARACTERS_DIR}"
+        )
+        self.character_status.setWordWrap(True)
+        self.pages["character"].body.addWidget(self.character_status)
+
+    def save_character(self):
+        name = re.sub(
+            r"[^A-Za-z0-9_-]+",
+            "_",
+            self.value("char_name")
+        )
+
+        if not name:
+            return self.warning("Character", "Укажи имя.")
+
+        data = {
+            "name": name,
+            "prompt": self.value("char_prompt"),
+            "negative_prompt": self.value("char_negative"),
+            "reference_image": self.value("char_reference"),
+            "created_at": datetime.now().isoformat(timespec="seconds")
+        }
+
+        path = engine.CHARACTERS_DIR / f"{name}.json"
+
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+        self.character_status.setText(f"Saved: {path}")
+        self.log(f"Character saved: {path}")
+
+    def load_character(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load character",
+            str(engine.CHARACTERS_DIR),
+            "Character profiles (*.json)"
+        )
+
+        if not path:
+            return
+
+        try:
+            data = json.loads(
+                Path(path).read_text(encoding="utf-8")
+            )
+
+            self.fields["char_name"].setText(data.get("name", ""))
+            self.fields["char_prompt"].setPlainText(data.get("prompt", ""))
+            self.fields["char_negative"].setPlainText(
+                data.get("negative_prompt", "")
+            )
+            self.fields["char_reference"].setText(
+                data.get("reference_image", "")
+            )
+
+            self.character_status.setText(f"Loaded: {path}")
+
+        except Exception as exc:
+            self.warning("Character", str(exc))
+
+    def use_character(self):
+        prompt = self.value("char_prompt")
+        negative = self.value("char_negative")
+
+        current = self.value("image_prompt")
+
+        self.fields["image_prompt"].setPlainText(
+            (prompt + ", " + current).strip(", ")
+        )
+
+        if negative:
+            old = self.value("image_negative")
+            self.fields["image_negative"].setPlainText(
+                (old + ", " + negative).strip(", ")
+            )
+
+        self.navigation.setCurrentRow(0)
+
+    # ---------------------------------------------------------
+    # SCENE STUDIO
+    # ---------------------------------------------------------
+
+    def _build_scene_page(self):
+        self._heading(
+            "scene",
+            "SCENE STUDIO",
+            "Создание сцен, storyboard и последовательных кадров."
+        )
+
+        form = self._group("scene", "Scene setup")
+
+        self._line(form, "scene_project", "Project name", "My_Project")
+        self._line(form, "scene_title", "Scene title", "Scene 01")
+
+        self._text(
+            form,
+            "scene_prompt",
+            "Scene prompt",
+            "wide cinematic establishing shot, coherent environment, consistent character design",
+            100
+        )
+
+        self._line(form, "scene_duration", "Duration", "4")
+        self._add_model_combo(form, "scene_model")
+        self._line(form, "scene_steps", "Generation steps", "20")
+
+        self.scene_list = QListWidget()
+        self.scene_list.setMinimumHeight(180)
+        self.pages["scene"].body.addWidget(self.scene_list)
+
+        self._button("scene", "ADD SCENE", self.add_scene)
+        self._button("scene", "REMOVE SELECTED", self.remove_scene)
+        self._button("scene", "SAVE STORYBOARD", self.save_storyboard)
+        self._button("scene", "LOAD STORYBOARD", self.load_storyboard)
+        self._button(
+            "scene",
+            "GENERATE STORYBOARD FRAMES",
+            self.generate_scene_frames
+        )
+
+    def add_scene(self):
+        try:
+            title = self.value("scene_title") or (
+                f"Scene {len(self.scene_data)+1:02d}"
+            )
+
+            prompt = self.value("scene_prompt")
+            duration = self.number("scene_duration", 4, float)
+
+            if duration <= 0 or duration > 600:
+                raise ValueError("Duration: 0–600 seconds.")
+
+            self.scene_data.append({
+                "title": title,
+                "prompt": prompt,
+                "duration": duration
+            })
+
+            self.refresh_scene_list()
+
+        except Exception as exc:
+            self.warning("Scene", str(exc))
+
+    def refresh_scene_list(self):
+        self.scene_list.clear()
+
+        for index, scene in enumerate(self.scene_data):
+            self.scene_list.addItem(
+                f"{index+1:02d}. {scene['title']} "
+                f"— {scene['duration']:g}s | {scene['prompt'][:100]}"
+            )
+
+    def remove_scene(self):
+        selected = sorted(
+            [self.scene_list.row(x) for x in self.scene_list.selectedItems()],
+            reverse=True
+        )
+
+        for index in selected:
+            self.scene_data.pop(index)
+
+        self.refresh_scene_list()
+
+    def save_storyboard(self):
+        name = re.sub(
+            r"[^A-Za-z0-9_-]+",
+            "_",
+            self.value("scene_project")
+        ) or "storyboard"
+
+        path = engine.SCENES_DIR / f"{name}.json"
+
+        path.write_text(
+            json.dumps({
+                "project": name,
+                "scenes": self.scene_data
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+        self.log(f"Storyboard saved: {path}")
+
+    def load_storyboard(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load storyboard",
+            str(engine.SCENES_DIR),
+            "JSON (*.json)"
+        )
+
+        if not path:
+            return
+
+        try:
+            data = json.loads(
+                Path(path).read_text(encoding="utf-8")
+            )
+
+            self.scene_data = data.get("scenes", [])
+
+            self.fields["scene_project"].setText(
+                data.get("project", "")
+            )
+
+            self.refresh_scene_list()
+
+        except Exception as exc:
+            self.warning("Storyboard", str(exc))
+
+    def generate_scene_frames(self):
+        if not self.scene_data:
+            return self.warning("Scene", "Добавь сцены.")
+
+        model = self.value("scene_model")
+        if not model:
+            return self.warning("Scene", "Выбери checkpoint.")
+
+        model = self.relative(model)
+        steps = self.number("scene_steps", 20)
+        scenes = [dict(x) for x in self.scene_data]
+
+        def job(callback):
+            for index, scene in enumerate(scenes):
+                prompt = scene.get("prompt", "").strip()
+
+                if not prompt:
+                    continue
+
+                engine.run_generation(
+                    "txt2img",
+                    model,
+                    prompt,
+                    "blurry, low quality, inconsistent scene",
+                    None,
+                    None,
+                    steps,
+                    6.5,
+                    0.0,
+                    768,
+                    512,
+                    -1,
+                    callback
+                )
+
+                callback(
+                    None,
+                    f"Storyboard frame {index+1}/{len(scenes)}"
+                )
+
+            engine.cleanup()
+
+        self.start_task("Storyboard generation", job)
+
+    # ---------------------------------------------------------
+    # MOTION / VIDEO
+    # ---------------------------------------------------------
+
+    def _build_video_page(self):
+        self._heading(
+            "video",
+            "MOTION / VIDEO STUDIO",
+            "AnimateDiff Text-to-Video and Stable Video Diffusion XT Image-to-Video."
+        )
+
+        form = self._group("video", "AnimateDiff")
+
+        self._add_model_combo(form, "video_model")
+
+        motion_dirs = sorted({
+            str(p.parent.relative_to(engine.ROOT))
+            for p in engine.MOTION.rglob("config.json")
+        })
+
+        self._combo(
+            form,
+            "video_motion",
+            "Motion adapter",
+            motion_dirs
+        )
+
+        motion_loras = [
+            str(p.relative_to(engine.ROOT))
+            for p in engine.scan_files(
+                engine.MOTION / "motion-lora",
+                (".safetensors",)
+            )
+        ]
+
+        self._combo(
+            form,
+            "video_motion_lora",
+            "Motion LoRA",
+            [""] + motion_loras
+        )
+
+        self._text(
+            form,
+            "video_prompt",
+            "Prompt",
+            "cinematic camera movement, natural motion, detailed scene",
+            100
+        )
+
+        self._text(
+            form,
+            "video_negative",
+            "Negative prompt",
+            "flicker, jitter, distorted anatomy, blurry",
+            65
+        )
+
+        self._line(form, "video_steps", "Steps", "20")
+        self._line(form, "video_cfg", "CFG", "7")
+        self._line(form, "video_frames", "Frames", "12")
+        self._line(form, "video_fps", "Native generation FPS", "8")
+        self._checkbox(
+            form, "video_smooth60",
+            "После генерации создать плавную версию 60 FPS (интерполяция)",
+            False
+        )
+
+        self._button(
+            "video",
+            "GENERATE ANIMATEDIFF VIDEO",
+            self.generate_animatediff
+        )
+
+        svd = self._group("video", "SVD-XT — Image to Video")
+
+        self._file(
+            svd,
+            "svd_image",
+            "Source image",
+            "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+
+        self._text(
+            svd,
+            "svd_motion_notes",
+            "Motion notes",
+            "subtle camera movement, gentle natural motion",
+            75
+        )
+
+        self._text(
+            svd,
+            "svd_negative",
+            "Negative prompt",
+            "flicker, jitter, sudden cuts, face distortion, blurry",
+            65
+        )
+
+        self._line(svd, "svd_duration", "Duration seconds", "4")
+        self._line(svd, "svd_fps", "FPS", "7")
+        self._line(svd, "svd_motion", "Motion bucket", "100")
+        self._line(svd, "svd_noise", "Noise strength", "0.03")
+        self._line(svd, "svd_steps", "Steps", "25")
+        self._line(svd, "svd_decode", "Decode chunk", "2")
+        self._line(svd, "svd_seed", "Seed", "-1")
+        self._checkbox(
+            svd, "svd_smooth60",
+            "После генерации создать плавную версию 60 FPS (интерполяция)",
+            False
+        )
+
+        self._button(
+            "video",
+            "GENERATE SVD-XT VIDEO",
+            self.generate_svd
+        )
+
+        note = QLabel(
+            "RTX 3060 Laptop 6 GB: начинай с 8–12 кадров AnimateDiff "
+            "и decode chunk 1–2 для SVD. SVD-XT не является text-to-video моделью."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#e8bd6b;")
+        self.pages["video"].body.addWidget(note)
+
+    def generate_animatediff(self):
+        try:
+            model = self.value("video_model")
+            motion = self.value("video_motion")
+
+            if not model or not motion:
+                raise RuntimeError("Нужны checkpoint и motion adapter.")
+
+            model = self.relative(model)
+            motion = self.relative(motion)
+
+            prompt = self.value("video_prompt")
+            negative = self.value("video_negative")
+
+            steps = self.number("video_steps", 20)
+            cfg = self.number("video_cfg", 7, float)
+            frames = self.number("video_frames", 12)
+            fps = self.number("video_fps", 8)
+
+            if not 4 <= frames <= 24:
+                raise ValueError("Frames: 4–24.")
+
+            if not 1 <= fps <= 30:
+                raise ValueError("FPS: 1–30.")
+
+            motion_lora = self.value("video_motion_lora") or None
+
+        except Exception as exc:
+            return self.warning("AnimateDiff", str(exc))
+
+        smooth60 = self.value("video_smooth60")
+
+        def job(callback):
+            def receive(image, message):
+                callback(image, message)
+                if smooth60 and message:
+                    output = _video_path_from_message(message)
+                    if output:
+                        smooth_video_to_60fps(output, callback)
+
+            engine.make_animatediff(
+                model, motion, prompt, negative, steps, cfg,
+                frames, fps, None, receive, motion_lora
+            )
+
+        self.start_task("AnimateDiff", job)
+
+    def generate_svd(self):
+        try:
+            image = self.value("svd_image")
+
+            if not image or not Path(image).is_file():
+                raise RuntimeError("Выбери исходное изображение.")
+
+            duration = self.number("svd_duration", 4, float)
+            fps = self.number("svd_fps", 7)
+            motion = self.number("svd_motion", 100)
+            noise = self.number("svd_noise", 0.03, float)
+            steps = self.number("svd_steps", 25)
+            decode = self.number("svd_decode", 2)
+            seed = self.number("svd_seed", -1)
+
+            if not 0.5 <= duration <= 180:
+                raise ValueError("Duration: 0.5–180.")
+
+            if not 3 <= fps <= 15:
+                raise ValueError("FPS: 3–15.")
+
+            if not 0 <= motion <= 255:
+                raise ValueError("Motion bucket: 0–255.")
+
+            if not 0 <= noise <= 0.5:
+                raise ValueError("Noise: 0–0.5.")
+
+            if not 10 <= steps <= 60:
+                raise ValueError("Steps: 10–60.")
+
+            if not 1 <= decode <= 8:
+                raise ValueError("Decode chunk: 1–8.")
+
+        except Exception as exc:
+            return self.warning("SVD-XT", str(exc))
+
+        motion_notes = self.value("svd_motion_notes")
+        negative = self.value("svd_negative")
+        smooth60 = self.value("svd_smooth60")
+
+        def job(callback):
+            def receive(result_image, message):
+                callback(result_image, message)
+                if smooth60 and message:
+                    output = _video_path_from_message(message)
+                    if output:
+                        smooth_video_to_60fps(output, callback)
+
+            engine.make_svd_video(
+                image, motion_notes, negative, duration, fps,
+                motion, noise, steps, decode, receive, seed
+            )
+
+        self.start_task("SVD-XT", job)
+
+    # ---------------------------------------------------------
+    # TIMELINE
+    # ---------------------------------------------------------
+
+    def _build_timeline_page(self):
+        self._heading(
+            "timeline",
+            "TIMELINE / VIDEO EXPORT",
+            "Добавляй фотографии и видео, меняй порядок, задавай длительность фотографий и экспортируй MP4."
+        )
+
+        form = self._group("timeline", "Export settings")
+
+        self._line(form, "timeline_duration", "Default photo duration", "4")
+        self._line(form, "timeline_fps", "Output FPS (30 or 60)", "30")
+        self._checkbox(
+            form, "timeline_smooth60",
+            "Экспортировать и дополнительно интерполировать до плавных 60 FPS",
+            False
+        )
+
+        self._file(
+            form,
+            "timeline_audio",
+            "Audio track",
+            "Audio (*.wav *.mp3 *.m4a *.aac)"
+        )
+
+        self.timeline_list = QListWidget()
+        self.timeline_list.setMinimumHeight(220)
+        self.pages["timeline"].body.addWidget(self.timeline_list)
+
+        self._button("timeline", "ADD MEDIA", self.timeline_add)
+        self._button("timeline", "REMOVE SELECTED", self.timeline_remove)
+        self._button("timeline", "MOVE SELECTED UP", lambda: self.timeline_move(-1))
+        self._button("timeline", "MOVE SELECTED DOWN", lambda: self.timeline_move(1))
+        self._button("timeline", "SET SELECTED PHOTO DURATION", self.timeline_set_duration)
+        self._button("timeline", "EXPORT MP4", self.timeline_export)
+
+    def timeline_add(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add media",
+            str(engine.OUTPUT),
+            "Media (*.png *.jpg *.jpeg *.webp *.bmp *.mp4 *.mov *.mkv *.avi *.webm)"
+        )
+
+        if not paths:
+            return
+
+        duration = self.number("timeline_duration", 4, float)
+
+        if duration <= 0:
+            return self.warning("Timeline", "Duration должна быть больше нуля.")
+
+        image_ext = {
+            ".png", ".jpg", ".jpeg", ".webp", ".bmp"
+        }
+
+        for path in paths:
+            is_image = Path(path).suffix.lower() in image_ext
+
+            self.timeline_items.append({
+                "path": path,
+                "duration": duration if is_image else None
+            })
+
+        self.refresh_timeline()
+
+    def refresh_timeline(self):
+        self.timeline_list.clear()
+
+        for item in self.timeline_items:
+            name = Path(item["path"]).name
+            duration = item.get("duration")
+
+            label = (
+                f"{name} — {duration:g}s"
+                if duration is not None
+                else f"{name} — full video"
+            )
+
+            self.timeline_list.addItem(label)
+
+    def timeline_remove(self):
+        selected = sorted(
+            [self.timeline_list.row(x) for x in self.timeline_list.selectedItems()],
+            reverse=True
+        )
+
+        for index in selected:
+            self.timeline_items.pop(index)
+
+        self.refresh_timeline()
+
+    def timeline_move(self, delta):
+        selected = self.timeline_list.currentRow()
+
+        if selected < 0:
+            return
+
+        target = selected + delta
+
+        if not 0 <= target < len(self.timeline_items):
+            return
+
+        self.timeline_items[selected], self.timeline_items[target] = (
+            self.timeline_items[target],
+            self.timeline_items[selected]
+        )
+
+        self.refresh_timeline()
+        self.timeline_list.setCurrentRow(target)
+
+    def timeline_set_duration(self):
+        index = self.timeline_list.currentRow()
+
+        if index < 0:
+            return self.warning("Timeline", "Выбери клип.")
+
+        item = self.timeline_items[index]
+
+        if item.get("duration") is None:
+            return self.warning(
+                "Timeline",
+                "Длительность видео пока берётся из исходного файла."
+            )
+
+        duration = self.number("timeline_duration", 4, float)
+
+        if duration <= 0:
+            return self.warning("Timeline", "Duration должна быть больше нуля.")
+
+        item["duration"] = duration
+        self.refresh_timeline()
+        self.timeline_list.setCurrentRow(index)
+
+    def timeline_export(self):
+        if not self.timeline_items:
+            return self.warning("Timeline", "Добавь медиафайлы.")
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export video",
+            str(engine.OUTPUT / "aether_export.mp4"),
+            "MP4 (*.mp4)"
+        )
+
+        if not path:
+            return
+
+        items = [dict(x) for x in self.timeline_items]
+
+        for item in items:
+            if not Path(item["path"]).is_file():
+                return self.warning(
+                    "Timeline",
+                    f"Файл не найден: {item['path']}"
+                )
+
+        audio = self.value("timeline_audio") or None
+        fps = self.number("timeline_fps", 30)
+
+        smooth60 = self.value("timeline_smooth60")
+
+        def job(callback):
+            exported = engine.export_timeline(items, path, audio, fps)
+            callback(None, f"Export finished: {exported}")
+            if smooth60 and fps != 60:
+                smooth_video_to_60fps(exported, callback)
+            elif smooth60 and fps == 60:
+                # The export already has 60 frames per second; no second interpolation pass.
+                callback(None, "Timeline уже экспортирован в 60 FPS. Дополнительная интерполяция не требуется.")
+
+        self.start_task("Timeline export", job)
+
+    # ---------------------------------------------------------
+    # COMFYUI
+    # ---------------------------------------------------------
+
+    def _build_comfy_page(self):
+        self._heading(
+            "comfy",
+            "COMFYUI LOCAL BRIDGE",
+            "Используй ComfyUI как дополнительный графический движок для сложных workflows."
+        )
+
+        form = self._group("comfy", "Local server")
+
+        self._line(
+            form,
+            "comfy_url",
+            "Server URL",
+            "http://127.0.0.1:8188"
+        )
+
+        self._file(
+            form,
+            "comfy_workflow",
+            "API workflow JSON",
+            "JSON (*.json)"
+        )
+
+        self._button(
+            "comfy",
+            "CHECK COMFYUI CONNECTION",
+            self.comfy_check
+        )
+
+        self._button(
+            "comfy",
+            "RUN API WORKFLOW",
+            self.comfy_run
+        )
+
+        self.comfy_status = QLabel(
+            "Ожидание локального ComfyUI..."
+        )
+        self.comfy_status.setWordWrap(True)
+        self.pages["comfy"].body.addWidget(self.comfy_status)
+
+        note = QLabel(
+            "Требуется API-format JSON, экспортированный из ComfyUI. "
+            "Обычный workflow JSON может не подойти."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#e8bd6b;")
+        self.pages["comfy"].body.addWidget(note)
+
+    def _comfy_base(self):
+        base = self.value("comfy_url").rstrip("/")
+        parsed = urllib.parse.urlparse(base)
+
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("Неверная схема URL.")
+
+        if parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+            raise ValueError("Разрешён только локальный ComfyUI.")
+
+        return base
+
+    def comfy_check(self):
+        try:
+            base = self._comfy_base()
+        except Exception as exc:
+            return self.warning("ComfyUI", str(exc))
+
+        def job(callback):
+            with urllib.request.urlopen(
+                base + "/system_stats",
+                timeout=8
+            ) as response:
+                data = json.loads(response.read().decode("utf-8"))
+
+            callback(
+                None,
+                "ComfyUI connected:\n" +
+                json.dumps(data, ensure_ascii=False)[:2500]
+            )
+
+        self.start_task("ComfyUI connection", job)
+
+    def comfy_run(self):
+        workflow = self.value("comfy_workflow")
+
+        if not workflow or not Path(workflow).is_file():
+            return self.warning("ComfyUI", "Выбери API workflow JSON.")
+
+        try:
+            base = self._comfy_base()
+        except Exception as exc:
+            return self.warning("ComfyUI", str(exc))
+
+        self.start_task(
+            "ComfyUI workflow",
+            lambda cb: engine.submit_comfyui_workflow(
+                base,
+                workflow,
+                cb
+            )
+        )
+
+    # ---------------------------------------------------------
+    # FACE STUDIO
+    # ---------------------------------------------------------
+
+    def _build_face_page(self):
+        self._heading(
+            "face",
+            "FACE STUDIO",
+            "Локальные операции с фотографиями и видео. Используй материалы, на которые у тебя есть разрешение."
+        )
+
+        form = self._group("face", "Face Swap")
+
+        self._file(
+            form,
+            "face_source",
+            "Source face",
+            "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+
+        self._file(
+            form,
+            "face_target",
+            "Target image",
+            "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+
+        self._checkbox(
+            form,
+            "face_consent",
+            "У меня есть разрешение использовать исходное и целевое изображение",
+            False
+        )
+
+        self._button(
+            "face",
+            "RUN PHOTO FACE SWAP",
+            self.face_swap
+        )
+
+        video = self._group("face", "Video Face Swap")
+
+        self._file(
+            video,
+            "face_video",
+            "Target video",
+            "Video (*.mp4 *.mov *.mkv *.avi)"
+        )
+
+        self._line(video, "face_source_index", "Source face index", "1")
+        self._line(video, "face_target_index", "Target face index", "1")
+
+        self._checkbox(
+            video,
+            "face_video_consent",
+            "У меня есть разрешение использовать исходное лицо и целевое видео",
+            False
+        )
+
+        self._button(
+            "face",
+            "RUN VIDEO FACE SWAP",
+            self.face_swap_video
+        )
+
+        fusion = self._group("face", "Optional FaceFusion")
+
+        self._file(
+            fusion,
+            "fusion_source",
+            "Source image",
+            "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+
+        self._file(
+            fusion,
+            "fusion_target",
+            "Target image / video",
+            "Media (*.png *.jpg *.jpeg *.webp *.mp4 *.mov *.mkv)"
+        )
+
+        self._button(
+            "face",
+            "RUN LOCAL FACEFUSION",
+            self.facefusion
+        )
+
+        portrait = self._group("face", "Portrait restoration")
+
+        self._file(
+            portrait,
+            "portrait_image",
+            "Source portrait",
+            "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+
+        self._button(
+            "face",
+            "RESTORE PORTRAIT — GFPGAN",
+            self.restore_portrait
+        )
+
+    def face_swap(self):
+        if not self.value("face_consent"):
+            return self.warning("Face Swap", "Подтверди разрешение.")
+
+        source = self.value("face_source")
+        target = self.value("face_target")
+
+        if not source or not target:
+            return self.warning("Face Swap", "Выбери оба изображения.")
+
+        self.start_task(
+            "Photo Face Swap",
+            lambda cb: engine.run_face_swap(source, target, cb)
+        )
+
+    def face_swap_video(self):
+        if not self.value("face_video_consent"):
+            return self.warning("Video Face Swap", "Подтверди разрешение.")
+
+        source = self.value("face_source")
+        video = self.value("face_video")
+
+        if not source or not video:
+            return self.warning("Video Face Swap", "Выбери фото и видео.")
+
+        source_index = self.number("face_source_index", 1)
+        target_index = self.number("face_target_index", 1)
+
+        self.start_task(
+            "Video Face Swap",
+            lambda cb: engine.run_video_face_swap(
+                source,
+                video,
+                cb,
+                source_index,
+                target_index
+            )
+        )
+
+    def facefusion(self):
+        source = self.value("fusion_source")
+        target = self.value("fusion_target")
+
+        if not source or not target:
+            return self.warning("FaceFusion", "Выбери source и target.")
+
+        self.start_task(
+            "FaceFusion",
+            lambda cb: engine.run_facefusion(source, target, cb)
+        )
+
+    def restore_portrait(self):
+        path = self.value("portrait_image")
+
+        if not path:
+            return self.warning("GFPGAN", "Выбери изображение.")
+
+        self.start_task(
+            "Portrait restoration",
+            lambda cb: engine.restore_portrait(path, cb)
+        )
+
+    # ---------------------------------------------------------
+    # ENHANCEMENT
+    # ---------------------------------------------------------
+
+    def _build_enhance_page(self):
+        self._heading(
+            "enhance",
+            "IMAGE ENHANCEMENT",
+            "Увеличение разрешения через локальный Real-ESRGAN NCNN Vulkan."
+        )
+
+        form = self._group("enhance", "Real-ESRGAN")
+
+        self._file(
+            form,
+            "upscale_image",
+            "Input image",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp)"
+        )
+
+        self._combo(
+            form,
+            "upscale_model",
+            "Model",
+            [
+                "realesrgan-x4plus",
+                "realesrgan-x4plus-anime",
+                "realesr-animevideov3"
+            ]
+        )
+
+        self._combo(
+            form,
+            "upscale_scale",
+            "Scale",
+            ["2", "3", "4"],
+            "4"
+        )
+
+        self._button(
+            "enhance",
+            "UPSCALE IMAGE",
+            self.run_upscale
+        )
+
+    def run_upscale(self):
+        path = self.value("upscale_image")
+
+        if not path or not Path(path).is_file():
+            return self.warning("Upscale", "Выбери изображение.")
+
+        try:
+            from PIL import Image
+            image = Image.open(path).convert("RGB")
+
+            model = self.value("upscale_model")
+            scale = self.number("upscale_scale", 4)
+
+        except Exception as exc:
+            return self.warning("Upscale", str(exc))
+
+        self.start_task(
+            "Real-ESRGAN",
+            lambda cb: engine.upscale_image(
+                image,
+                cb,
+                scale,
+                model
+            )
+        )
+
+    # ---------------------------------------------------------
+    # CONTROLNET
+    # ---------------------------------------------------------
+
+    def _build_control_page(self):
+        self._heading(
+            "control",
+            "CONTROLNET STUDIO",
+            "Контроль структуры и композиции через локальные ControlNet модели."
+        )
+
+        form = self._group("control", "ControlNet")
+
+        self._add_model_combo(form, "control_model")
+
+        self._combo(
+            form,
+            "control_mode",
+            "Mode",
+            ["Canny", "OpenPose", "Depth", "Tile"]
+        )
+
+        self._combo(
+            form,
+            "control_weights",
+            "ControlNet model",
+            engine.list_controlnet_models()
+        )
+
+        self._file(
+            form,
+            "control_image",
+            "Input image",
+            "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+
+        self._text(
+            form,
+            "control_prompt",
+            "Prompt",
+            "high quality, detailed image",
+            90
+        )
+
+        self._text(
+            form,
+            "control_negative",
+            "Negative prompt",
+            "blurry, artifacts, distorted anatomy",
+            65
+        )
+
+        self._line(form, "control_steps", "Steps", "20")
+        self._line(form, "control_cfg", "CFG", "6.5")
+        self._line(form, "control_strength", "Strength", "0.8")
+
+        self._button(
+            "control",
+            "GENERATE WITH CONTROLNET",
+            self.run_controlnet
+        )
+
+    def run_controlnet(self):
+        model = self.value("control_model")
+        control = self.value("control_weights")
+        image = self.value("control_image")
+
+        if not model or not control or not image:
+            return self.warning(
+                "ControlNet",
+                "Выбери checkpoint, ControlNet и изображение."
+            )
+
+        mode = self.value("control_mode")
+        model_rel = self.relative(model)
+        control_rel = self.relative(control)
+        prompt = self.value("control_prompt")
+        negative = self.value("control_negative")
+        steps = self.number("control_steps", 20)
+        cfg = self.number("control_cfg", 6.5, float)
+        strength = self.number("control_strength", 0.8, float)
+
+        self.start_task(
+            "ControlNet",
+            lambda cb: engine.run_controlnet_mode(
+                mode, model_rel, control_rel, image,
+                prompt, negative, steps, cfg, strength, cb
+            )
+        )
+
+    # ---------------------------------------------------------
+    # VOICE STUDIO
+    # ---------------------------------------------------------
+
+    def _build_voice_page(self):
+        self._heading(
+            "voice",
+            "VOICE STUDIO",
+            "Локальный синтез речи, lip-sync и конвертация голоса."
+        )
+
+        piper = self._group("voice", "Piper TTS")
+
+        self._text(
+            piper,
+            "voice_text",
+            "Text",
+            "Hello! This is a fictional AI character voice.",
+            100
+        )
+
+        voices = [
+            str(p)
+            for p in engine.VOICE_MODELS.glob("*.onnx")
+        ]
+
+        self._combo(
+            piper,
+            "voice_model",
+            "Voice model",
+            voices
+        )
+
+        self._button(
+            "voice",
+            "GENERATE WAV",
+            self.generate_voice
+        )
+
+        lip = self._group("voice", "Lip Sync")
+
+        self._file(
+            lip,
+            "lipsync_video",
+            "Face video",
+            "Video (*.mp4 *.mov *.mkv)"
+        )
+
+        self._file(
+            lip,
+            "lipsync_audio",
+            "Audio",
+            "Audio (*.wav *.mp3 *.m4a)"
+        )
+
+        self._button(
+            "voice",
+            "CREATE LIP-SYNC VIDEO",
+            self.run_lipsync
+        )
+
+        rvc = self._group("voice", "RVC")
+
+        self._file(
+            rvc,
+            "rvc_audio",
+            "Input audio",
+            "Audio (*.wav *.mp3 *.flac)"
+        )
+
+        self._file(
+            rvc,
+            "rvc_model",
+            "RVC model",
+            "RVC model (*.pth)"
+        )
+
+        self._file(
+            rvc,
+            "rvc_index",
+            "Index (optional)",
+            "Index (*.index)"
+        )
+
+        self._button(
+            "voice",
+            "RUN RVC CONVERSION",
+            self.run_rvc
+        )
+
+    def generate_voice(self):
+        text_value = self.value("voice_text")
+        model = self.value("voice_model")
+
+        if not text_value or not model:
+            return self.warning("Piper", "Нужны текст и voice model.")
+
+        self.start_task(
+            "Piper TTS",
+            lambda cb: engine.synthesize_voice_piper(
+                text_value,
+                model,
+                cb
+            )
+        )
+
+    def run_lipsync(self):
+        video = self.value("lipsync_video")
+        audio = self.value("lipsync_audio")
+
+        if not video or not audio:
+            return self.warning("Lip Sync", "Выбери видео и аудио.")
+
+        self.start_task(
+            "Lip Sync",
+            lambda cb: engine.create_lipsync_video(
+                video,
+                audio,
+                cb
+            )
+        )
+
+    def run_rvc(self):
+        audio = self.value("rvc_audio")
+        model = self.value("rvc_model")
+        index = self.value("rvc_index")
+
+        if not audio or not model:
+            return self.warning("RVC", "Выбери аудио и модель.")
+
+        self.start_task(
+            "RVC",
+            lambda cb: engine.run_rvc_conversion(
+                audio,
+                model,
+                index,
+                cb
+            )
+        )
+
+    # ---------------------------------------------------------
+    # SYSTEM / MODEL MANAGER
+    # ---------------------------------------------------------
+
+    def _build_system_page(self):
+        self._heading(
+            "system",
+            "SYSTEM / MODEL MANAGER",
+            "Проверка установленных моделей, путей, GPU и внешних инструментов."
+        )
+
+        self.system_info = QTextEdit()
+        self.system_info.setReadOnly(True)
+        self.system_info.setMinimumHeight(260)
+
+        self.pages["system"].body.addWidget(self.system_info)
+
+        self._button(
+            "system",
+            "REFRESH DIAGNOSTICS",
+            self.refresh_system
+        )
+
+        self._button(
+            "system",
+            "RESCAN MODELS",
+            self.refresh_models
+        )
+
+        self._button(
+            "system",
+            "CLEAR GPU CACHE",
+            self.clear_cache
+        )
+
+        self._button(
+            "system",
+            "OPEN OUTPUT FOLDER",
+            lambda: self.open_folder(engine.OUTPUT)
+        )
+
+        self._button(
+            "system",
+            "OPEN MODELS FOLDER",
+            lambda: self.open_folder(engine.MODELS)
+        )
+
+        self._button(
+            "system",
+            "OPEN PROJECT FOLDER",
+            lambda: self.open_folder(engine.ROOT)
+        )
+
+    def refresh_models(self):
+        try:
+            models = engine.list_checkpoints()
+
+            for key in (
+                "image_model",
+                "canvas_model",
+                "scene_model",
+                "video_model",
+                "control_model"
+            ):
+                widget = self.fields.get(key)
+
+                if not isinstance(widget, QComboBox):
+                    continue
+
+                current = widget.currentText()
+
+                widget.clear()
+                widget.addItems(models)
+
+                index = widget.findText(current)
+
+                if index >= 0:
+                    widget.setCurrentIndex(index)
+
+            optional_map = {
+                "image_lora": "lora",
+                "image_vae": "vae",
+                "image_embedding": "embedding",
+                "image_ip": "ip_adapter",
+            }
+            for key, kind in optional_map.items():
+                widget = self.fields.get(key)
+                if isinstance(widget, QComboBox):
+                    current = widget.currentText()
+                    widget.clear()
+                    widget.addItems([""] + engine.component_relpaths(kind))
+                    index = widget.findText(current)
+                    if index >= 0:
+                        widget.setCurrentIndex(index)
+
+            self.log(
+                f"Checkpoints found: {len(models)}; optional components refreshed."
+            )
+
+        except Exception as exc:
+            self.log(f"Model scan error: {exc}")
+
+        self.refresh_system()
+
+    def refresh_system(self):
+        if engine is None:
+            return
+
+        try:
+            import torch
+
+            cuda = torch.cuda.is_available()
+
+            if cuda:
+                gpu = torch.cuda.get_device_name(0)
+                memory = (
+                    torch.cuda.get_device_properties(0).total_memory
+                    / 1024**3
+                )
+            else:
+                gpu = "CPU"
+                memory = 0
+
+            ffmpeg = engine.get_ffmpeg()
+
+            checkpoints = engine.list_checkpoints()
+
+            lines = [
+                APP_NAME,
+                VERSION,
+                "",
+                f"Project: {engine.ROOT}",
+                f"Python: {sys.version.split()[0]}",
+                f"PyTorch: {torch.__version__}",
+                f"CUDA available: {cuda}",
+                f"GPU: {gpu}",
+                f"VRAM total: {memory:.2f} GB",
+                f"Checkpoints: {len(checkpoints)}",
+                f"LoRA: {len(engine.component_files('lora'))}",
+                f"VAE: {len(engine.component_files('vae'))}",
+                f"Embeddings: {len(engine.component_files('embedding'))}",
+                f"IP-Adapter: {len(engine.component_files('ip_adapter'))}",
+                f"ControlNet: {len(engine.list_controlnet_models())}",
+                f"Motion: {len(engine.scan_files(engine.MOTION))}",
+                f"Voice: {len(engine.scan_files(engine.VOICE_MODELS, ('.onnx',)))}",
+                f"FFmpeg: {ffmpeg}",
+                "",
+                "EXTERNAL COMPONENTS",
+                f"GFPGAN weights: {(engine.ROOT / 'GFPGANv1.4.pth').is_file()}",
+                f"FaceSwap model: {(engine.INSIGHT / 'inswapper_128.onnx').is_file()}",
+                f"FaceFusion: {(engine.TOOLS_DIR / 'facefusion' / 'facefusion.py').is_file()}",
+                f"Wav2Lip: {(engine.TOOLS_DIR / 'Wav2Lip' / 'inference.py').is_file()}",
+                f"RVC CLI: {(engine.TOOLS_DIR / 'RVC' / 'infer_cli.py').is_file()}",
+                "",
+                "VIDEO TOOLS",
+                f"Real-ESRGAN: {(engine.ROOT / 'external' / 'realesrgan' / 'portable' / 'realesrgan-ncnn-vulkan.exe').is_file()}",
+                f"Blender: {(engine.ROOT / 'external' / 'blender' / 'blender.exe').is_file()}",
+            ]
+
+            if cuda:
+                lines += [
+                    f"VRAM allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB",
+                    f"VRAM reserved: {torch.cuda.memory_reserved()/1024**3:.2f} GB"
+                ]
+
+            self.system_info.setPlainText("\n".join(lines))
+
+            self.gpu_label.setText(
+                f"{gpu}  |  {memory:.1f} GB VRAM"
+            )
+
+        except Exception as exc:
+            self.system_info.setPlainText(
+                "Diagnostics failed:\n" + str(exc)
+            )
+
+    def clear_cache(self):
+        self.start_task(
+            "GPU cleanup",
+            lambda cb: (
+                engine.cleanup(drop_pipeline=False),
+                cb(None, "GPU cache cleanup finished.")
+            )
+        )
+
+    def open_folder(self, path):
+        try:
+            path = Path(path)
+            path.mkdir(parents=True, exist_ok=True)
+
+            if sys.platform == "win32":
+                os.startfile(str(path))
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", str(path)])
+
+        except Exception as exc:
+            self.warning("Open folder", str(exc))
+
+    # ---------------------------------------------------------
+    # WORKERS / RESULTS / LOGGING
+    # ---------------------------------------------------------
+
+    def start_task(self, title, function):
+        if self.thread is not None and self.thread.isRunning():
+            return self.warning(
+                "Busy",
+                "Дождись завершения текущей задачи."
+            )
+
+        self.status.setText(title)
+        self.busy_label.setText("RUNNING")
+        self.progress.setValue(0)
+
+        self.log(f"Started: {title}")
+
+        self.thread = QThread()
+        self.worker = Worker(function)
+
+        self.worker.moveToThread(self.thread)
+
+        self.thread.started.connect(self.worker.run)
+
+        self.worker.message.connect(self.on_message)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.finished.connect(self.on_finished)
+
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
+
+        self.thread.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self._thread_stopped)
+        self.thread.finished.connect(self.thread.deleteLater)
+
+        self.thread.start()
+
+    def on_message(self, image, message):
+        if image is not None:
+            try:
+                if hasattr(image, "convert"):
+                    image = image.convert("RGB")
+
+                    data = image.tobytes("raw", "RGB")
+
+                    qimage = QImage(
+                        data,
+                        image.width,
+                        image.height,
+                        image.width * 3,
+                        QImage.Format_RGB888
+                    ).copy()
+
+                    self.last_image = QPixmap.fromImage(qimage)
+
+                elif isinstance(image, str):
+                    self.last_image = QPixmap(image)
+
+            except Exception as exc:
+                self.log(f"Preview error: {exc}")
+
+        self.log(message)
+
+        if message:
+            match = re.search(
+                r"([A-Za-z]:\\[^\\r\\n]+\\.(?:png|jpg|jpeg|webp|mp4|wav))",
+                message,
+                re.IGNORECASE
+            )
+
+            if match:
+                path = Path(match.group(1))
+
+                if path.is_file() and path.suffix.lower() in (
+                    ".png", ".jpg", ".jpeg", ".webp"
+                ):
+                    self.last_image = QPixmap(str(path))
+
+        if self.last_image and not self.last_image.isNull():
+            self.status.setText(
+                f"Result received: {self.last_image.width()} × {self.last_image.height()}"
+            )
+
+        self.progress.setValue(
+            min(95, self.progress.value() + 10)
+        )
+
+    def on_finished(self):
+        self.progress.setValue(100)
+        self.status.setText("Task completed")
+        self.busy_label.setText("IDLE")
+        self.log("Task finished.")
+
+    def on_failed(self, error):
+        self.busy_label.setText("ERROR")
+        self.status.setText("Task failed")
+        self.log(error)
+
+        QMessageBox.critical(
+            self,
+            "AETHER task failed",
+            error[-5000:]
+        )
+
+    def log(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        self.log_box.append(
+            f"[{timestamp}] {message}"
+        )
+
+    def warning(self, title, message):
+        QMessageBox.warning(
+            self,
+            title,
+            str(message)
+        )
+
+    def _thread_stopped(self):
+        self.worker = None
+        self.thread = None
+        if self._close_when_done:
+            self._close_when_done = False
+            self.close()
+
+    def closeEvent(self, event):
+        if self.thread is not None and self.thread.isRunning():
+            answer = QMessageBox.question(
+                self,
+                "Task running",
+                "Задача ещё выполняется. Дождаться завершения и закрыть AETHER?"
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+            self._close_when_done = True
+            self.status.setText("Закрытие после завершения текущей задачи…")
+            event.ignore()
+            return
+        event.accept()
+
+
+def main():
+    application = QApplication(sys.argv)
+
+    application.setApplicationName(APP_NAME)
+    application.setFont(QFont("Segoe UI", 10))
+
+    try:
+        window = AetherStudio()
+        window.show()
+
+    except Exception:
+        QMessageBox.critical(
+            None,
+            "AETHER startup error",
+            traceback.format_exc()
+        )
+        return 1
+
+    return application.exec()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

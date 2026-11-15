@@ -29,10 +29,18 @@ CONTROLNET = MODELS / "controlnet"
 MOTION = MODELS / "animatediff"
 INSIGHT = MODELS / "insightface"
 VOICE_MODELS = MODELS / "voice"
+# Component locations: support both the conventional models/* folders and
+# the actual folders used by this installation. Keep primary constants for
+# backward compatibility with the legacy Tkinter interface.
 LORA_DIR = MODELS / "loras"
+LORA_DIRS = (MODELS / "loras", ROOT / "extensions")
 VAE_DIR = MODELS / "vae"
-EMBEDDINGS_DIR = MODELS / "embeddings"
-IP_ADAPTER_DIR = MODELS / "ip_adapter"
+VAE_DIRS = (MODELS / "vae", ROOT / "extensions")
+EMBEDDINGS_DIR = ROOT / "embeddings"
+EMBEDDINGS_DIRS = (ROOT / "embeddings", MODELS / "embeddings")
+IP_ADAPTER_DIR = ROOT / "h94" / "IP-Adapter" / "models"
+IP_ADAPTER_DIRS = (ROOT / "h94" / "IP-Adapter" / "models", MODELS / "ip_adapter")
+IP_ADAPTER_ROOT = ROOT / "h94" / "IP-Adapter"
 CHARACTERS_DIR = ROOT / "characters"
 SCENES_DIR = ROOT / "scenes"
 TOOLS_DIR = ROOT / "tools"
@@ -137,6 +145,103 @@ def scan_files(folder, suffixes=(".safetensors", ".ckpt", ".pt", ".pth", ".bin",
         return []
 
 
+def component_files(kind, suffixes=None):
+    """Return unique component files from all supported local directories."""
+    defaults = {
+        "lora": (LORA_DIRS, (".safetensors", ".ckpt", ".pt")),
+        "vae": (VAE_DIRS, (".safetensors", ".ckpt")),
+        "embedding": (EMBEDDINGS_DIRS, (".safetensors", ".pt", ".bin")),
+        "ip_adapter": (IP_ADAPTER_DIRS, (".safetensors", ".bin")),
+    }
+    if kind not in defaults:
+        raise ValueError(f"Неизвестный тип компонента: {kind}")
+    folders, default_suffixes = defaults[kind]
+    allowed = tuple(x.lower() for x in (suffixes or default_suffixes))
+    found = {}
+    for folder in folders:
+        for path in scan_files(folder, allowed):
+            # These are video/other-architecture adapters, not SD image LoRAs.
+            if kind == "lora" and any(tag in path.name.lower() for tag in ("wan", "flux", "ltx", "lightx2v")):
+                continue
+            if kind == "vae" and path.name.lower() == "ae.safetensors":
+                # ae.safetensors is the FLUX autoencoder, not an SD/SDXL VAE.
+                continue
+            if kind == "ip_adapter" and "faceid" in path.name.lower():
+                # FaceID weights require a separate FaceID/LoRA workflow.
+                continue
+            found[str(path.resolve()).lower()] = path
+    return sorted(found.values(), key=lambda p: (p.name.lower(), str(p).lower()))
+
+
+def component_relpaths(kind):
+    return [str(path.relative_to(ROOT)) for path in component_files(kind)]
+
+
+def checkpoint_input_channels(path):
+    """Определяет число входных каналов UNet для safetensors, ckpt и Diffusers."""
+    path = Path(path)
+    keys = ("conv_in.weight", "input_blocks.0.0.weight")
+
+    # Полная Diffusers-модель: число каналов хранится в конфигурации UNet.
+    if path.is_dir():
+        config_path = path / "unet" / "config.json"
+        try:
+            if config_path.is_file():
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                value = config.get("in_channels")
+                if value is not None:
+                    return int(value)
+        except Exception as exc:
+            log(f"Не удалось прочитать UNet config в {path}: {exc}")
+        return None
+
+    if not path.is_file():
+        return None
+
+    # Safetensors: читаем только заголовок/форму тензора, не загружая веса.
+    if path.suffix.lower() == ".safetensors":
+        try:
+            from safetensors import safe_open
+            with safe_open(str(path), framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if any(key.endswith(name) for name in keys):
+                        shape = handle.get_slice(key).get_shape()
+                        if len(shape) == 4:
+                            return int(shape[1])
+        except Exception as exc:
+            log(f"Не удалось определить UNet channels для {path.name}: {exc}")
+        return None
+
+    # Старые .ckpt-файлы тоже поддерживаем. map_location='meta' читает
+    # структуру state_dict без размещения многогигабайтных весов в RAM/VRAM.
+    if path.suffix.lower() == ".ckpt":
+        try:
+            try:
+                payload = torch.load(str(path), map_location="meta", weights_only=True)
+            except TypeError:
+                payload = torch.load(str(path), map_location="meta")
+            state = payload
+            if isinstance(payload, dict):
+                for wrapper in ("state_dict", "model", "module"):
+                    candidate = payload.get(wrapper)
+                    if isinstance(candidate, dict):
+                        state = candidate
+                        break
+            if isinstance(state, dict):
+                for key, tensor in state.items():
+                    if any(str(key).endswith(name) for name in keys):
+                        shape = getattr(tensor, "shape", ())
+                        if len(shape) == 4:
+                            return int(shape[1])
+        except Exception as exc:
+            log(f"Не удалось прочитать UNet channels из {path.name}: {exc}")
+
+    # Last-resort filename hint; never silently assume a 4-channel UNet.
+    if any(tag in path.name.lower() for tag in ("inpaint", "inpainting", "inp_")):
+        return 9
+    return None
+
+
 def apply_optional_components(pipe, lora_rel=None, lora_scale=1.0, vae_rel=None, embedding_rel=None, ip_adapter_rel=None):
     """Подключает локальные LoRA/VAE/embedding/IP-Adapter, если они выбраны."""
     if vae_rel:
@@ -176,7 +281,9 @@ def apply_optional_components(pipe, lora_rel=None, lora_scale=1.0, vae_rel=None,
         if not ip_path.exists():
             raise FileNotFoundError(f"IP-Adapter не найден: {ip_path}")
         try:
-            pipe.load_ip_adapter(str(ip_path.parent), subfolder="", weight_name=ip_path.name)
+            adapter_root = ip_path.parent.parent if ip_path.parent.name.lower() == "models" else ip_path.parent
+            adapter_subfolder = "models" if (adapter_root / "image_encoder").is_dir() else ""
+            pipe.load_ip_adapter(str(adapter_root), subfolder=adapter_subfolder, weight_name=ip_path.name)
         except Exception as exc:
             raise RuntimeError(f"Не удалось подключить IP-Adapter {ip_path.name}: {exc}") from exc
     return pipe
@@ -416,6 +523,13 @@ def load_pipeline(model_rel: str, task: str):
         )
 
     arch = architecture(path)
+    input_channels = checkpoint_input_channels(path)
+    is_nine_channel_inpaint = input_channels == 9
+    if input_channels not in (None, 4, 9):
+        raise RuntimeError(
+            f"У модели {path.name} обнаружен UNet с {input_channels} входными каналами. "
+            "Этот SD/SDXL backend поддерживает 4-канальные и 9-канальные UNet."
+        )
 
     if arch == "unsupported":
         raise RuntimeError(
@@ -441,14 +555,19 @@ def load_pipeline(model_rel: str, task: str):
             "img2img": StableDiffusionXLImg2ImgPipeline,
             "inpaint": StableDiffusionXLInpaintPipeline,
         }
+        inpaint_cls = StableDiffusionXLInpaintPipeline
     else:
         classes = {
             "txt2img": StableDiffusionPipeline,
             "img2img": StableDiffusionImg2ImgPipeline,
             "inpaint": StableDiffusionInpaintPipeline,
         }
+        inpaint_cls = StableDiffusionInpaintPipeline
 
-    cls = classes[task]
+    # A 9-channel checkpoint MUST be loaded with an Inpaint pipeline.
+    # For txt2img/img2img, run_generation supplies an all-white mask so the
+    # inpaint UNet can regenerate the full canvas instead of shape-mismatching.
+    cls = inpaint_cls if is_nine_channel_inpaint else classes[task]
     pipe = None
     fallback_inpaint = False
 
@@ -580,6 +699,8 @@ def run_generation(
     if has_optional:
         cleanup()
     pipe = load_pipeline(model, task)
+    if int(getattr(getattr(pipe.unet, "config", None), "in_channels", 4)) == 9:
+        log("Обнаружен 9-канальный Inpaint UNet: включён совместимый режим полной маски для Text2Img/Img2Img.")
     if has_optional:
         pipe = apply_optional_components(pipe, lora_rel, lora_scale, vae_rel, embedding_rel, ip_adapter_rel)
         pipe = patch_clip_embedding_device(pipe)
@@ -602,12 +723,26 @@ def run_generation(
         generator=gen
     )
 
+    nine_channel_unet = int(getattr(getattr(pipe.unet, "config", None), "in_channels", 4)) == 9
+
     if task == "txt2img":
-        kwargs.update(
-            width=width,
-            height=height,
-            guidance_scale=float(cfg)
-        )
+        if nine_channel_unet:
+            # Inpaint checkpoint used in text-to-image mode: start from a blank
+            # canvas and mark every pixel editable.
+            init_image = Image.new("RGB", (int(width), int(height)), (0, 0, 0))
+            full_mask = Image.new("L", init_image.size, 255)
+            kwargs.update(
+                image=init_image,
+                mask_image=full_mask,
+                strength=1.0,
+                guidance_scale=float(cfg)
+            )
+        else:
+            kwargs.update(
+                width=width,
+                height=height,
+                guidance_scale=float(cfg)
+            )
 
     elif task == "img2img":
         if source is None:
@@ -633,6 +768,8 @@ def run_generation(
             strength=strength,
             guidance_scale=float(cfg)
         )
+        if nine_channel_unet:
+            kwargs["mask_image"] = Image.new("L", init_image.size, 255)
 
     else:
         if source is None or mask is None:
@@ -1822,15 +1959,15 @@ class Studio:
         self.gen_style.pack(fill="x", padx=12, pady=4)
 
         tk.Label(left, text="LoRA (optional)", bg="#171b27", fg="#cbd5e1").pack(anchor="w", padx=12, pady=(8, 2))
-        self.gen_lora = ttk.Combobox(left, state="readonly", values=[""] + [str(p.relative_to(ROOT)) for p in scan_files(LORA_DIR, (".safetensors", ".ckpt", ".pt"))])
+        self.gen_lora = ttk.Combobox(left, state="readonly", values=[""] + [str(p.relative_to(ROOT)) for p in component_files("lora")])
         self.gen_lora.pack(fill="x", padx=12)
         self.gen_lora_weight = self._entry(left, "LoRA weight", "0.75")
         tk.Label(left, text="VAE / Embedding / IP-Adapter (optional)", bg="#171b27", fg="#cbd5e1").pack(anchor="w", padx=12, pady=(8, 2))
-        self.gen_vae = ttk.Combobox(left, state="readonly", values=[""] + [str(p.relative_to(ROOT)) for p in scan_files(VAE_DIR, (".safetensors", ".ckpt"))])
+        self.gen_vae = ttk.Combobox(left, state="readonly", values=[""] + [str(p.relative_to(ROOT)) for p in component_files("vae")])
         self.gen_vae.pack(fill="x", padx=12)
-        self.gen_embedding = ttk.Combobox(left, state="readonly", values=[""] + [str(p.relative_to(ROOT)) for p in scan_files(EMBEDDINGS_DIR, (".safetensors", ".pt", ".bin"))])
+        self.gen_embedding = ttk.Combobox(left, state="readonly", values=[""] + [str(p.relative_to(ROOT)) for p in component_files("embedding")])
         self.gen_embedding.pack(fill="x", padx=12, pady=3)
-        self.gen_ip_adapter = ttk.Combobox(left, state="readonly", values=[""] + [str(p.relative_to(ROOT)) for p in scan_files(IP_ADAPTER_DIR, (".safetensors", ".bin"))])
+        self.gen_ip_adapter = ttk.Combobox(left, state="readonly", values=[""] + [str(p.relative_to(ROOT)) for p in component_files("ip_adapter")])
         self.gen_ip_adapter.pack(fill="x", padx=12, pady=3)
         self.gen_ip_image = tk.StringVar()
         ip_row=tk.Frame(left,bg="#171b27"); ip_row.pack(fill="x",padx=12,pady=3)
@@ -2639,7 +2776,7 @@ class Studio:
     def refresh_system(self):
         try: ffmpeg_status=get_ffmpeg()
         except Exception: ffmpeg_status="not detected"
-        lines=[f"Project: {ROOT}",f"Python: {sys.version.split()[0]}",f"PyTorch: {torch.__version__}",f"CUDA available: {torch.cuda.is_available()}",f"Device: {DEVICE}",f"Checkpoints: {len(list_checkpoints())}",f"LoRA: {len(scan_files(LORA_DIR))}",f"VAE: {len(scan_files(VAE_DIR))}",f"Embeddings: {len(scan_files(EMBEDDINGS_DIR))}",f"IP-Adapter weights: {len(scan_files(IP_ADAPTER_DIR))}",f"ControlNet: {len(list_controlnet_models())}",f"Motion adapters/LoRAs: {len(scan_files(MOTION))}",f"Voice models: {len(scan_files(VOICE_MODELS,('.onnx',)))}",f"FFmpeg: {ffmpeg_status}",f"FaceSwap: InsightFace + inswapper_128 (local)",f"FaceFusion: {'installed' if (TOOLS_DIR/'facefusion'/'facefusion.py').is_file() else 'optional / not installed'}",f"Lip-sync: {'Wav2Lip installed' if (TOOLS_DIR/'Wav2Lip'/'inference.py').is_file() else 'optional / weights missing'}",f"RVC: {'CLI installed' if (TOOLS_DIR/'RVC'/'infer_cli.py').is_file() else 'optional / CLI wrapper missing'}"]
+        lines=[f"Project: {ROOT}",f"Python: {sys.version.split()[0]}",f"PyTorch: {torch.__version__}",f"CUDA available: {torch.cuda.is_available()}",f"Device: {DEVICE}",f"Checkpoints: {len(list_checkpoints())}",f"LoRA: {len(component_files('lora'))}",f"VAE: {len(component_files('vae'))}",f"Embeddings: {len(component_files('embedding'))}",f"IP-Adapter weights: {len(component_files('ip_adapter'))}",f"ControlNet: {len(list_controlnet_models())}",f"Motion adapters/LoRAs: {len(scan_files(MOTION))}",f"Voice models: {len(scan_files(VOICE_MODELS,('.onnx',)))}",f"FFmpeg: {ffmpeg_status}",f"FaceSwap: InsightFace + inswapper_128 (local)",f"FaceFusion: {'installed' if (TOOLS_DIR/'facefusion'/'facefusion.py').is_file() else 'optional / not installed'}",f"Lip-sync: {'Wav2Lip installed' if (TOOLS_DIR/'Wav2Lip'/'inference.py').is_file() else 'optional / weights missing'}",f"RVC: {'CLI installed' if (TOOLS_DIR/'RVC'/'infer_cli.py').is_file() else 'optional / CLI wrapper missing'}"]
         if torch.cuda.is_available():
             try: lines += [f"GPU: {torch.cuda.get_device_name(0)}",f"VRAM total: {torch.cuda.get_device_properties(0).total_memory/1024**3:.2f} GB",f"VRAM allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB",f"VRAM reserved: {torch.cuda.memory_reserved()/1024**3:.2f} GB"]
             except Exception: pass
